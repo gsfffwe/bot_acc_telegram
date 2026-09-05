@@ -74,6 +74,7 @@ DATA_DIR = Path(os.getenv("BOT_DATA_DIR", str(BASE_DIR)))
 DB_PATH = DATA_DIR / "telegram_shop.sqlite3"
 PORT = int(os.getenv("PORT", "8000"))
 WEBHOOK_TOKEN = os.getenv("SEPAY_WEBHOOK_TOKEN", "").strip()
+SEPAY_FORWARD_URL = os.getenv("SEPAY_FORWARD_URL", "").strip().rstrip("/")
 
 CATALOG_PAGE_SIZE = max(1, min(20, int(os.getenv("CATALOG_PAGE_SIZE", "8"))))
 MAX_QUANTITY = max(1, min(100, int(os.getenv("MAX_QUANTITY", "100"))))
@@ -1187,6 +1188,33 @@ def webhook_authorized(request: Request) -> bool:
     return bool(supplied) and hmac.compare_digest(supplied, WEBHOOK_TOKEN)
 
 
+async def forward_sepay_event(payload: Any, request: Request) -> bool:
+    """Chuyển giao dịch chưa khớp sang webhook của bot còn lại."""
+    if not SEPAY_FORWARD_URL or request.headers.get("x-sepay-forwarded") == "1":
+        return False
+    headers = {"X-Sepay-Forwarded": "1"}
+    if WEBHOOK_TOKEN:
+        headers["X-Webhook-Token"] = WEBHOOK_TOKEN
+    target_url = SEPAY_FORWARD_URL.rstrip("/")
+    if not target_url.endswith("/sepay/webhook"):
+        target_url += "/sepay/webhook"
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.post(
+                target_url,
+                json=payload,
+                headers=headers,
+            )
+        if response.status_code < 200 or response.status_code >= 300:
+            LOGGER.warning("Forwarded SePay event failed with HTTP %s", response.status_code)
+            return False
+        LOGGER.info("Forwarded unmatched SePay event to secondary bot")
+        return True
+    except httpx.HTTPError:
+        LOGGER.exception("Could not forward SePay event to secondary bot")
+        return False
+
+
 @app.get("/")
 async def root() -> dict[str, Any]:
     return {"ok": True, "service": "telegram-account-shop"}
@@ -1212,7 +1240,8 @@ async def sepay_webhook_post(request: Request) -> dict[str, Any]:
         return {"ok": False, "message": "invalid json"}
     amount, content, transaction_id = extract_payment_fields(payload)
     if amount <= 0 or not content:
-        return {"ok": True, "message": "ignored"}
+        forwarded = await forward_sepay_event(payload, request)
+        return {"ok": True, "message": "forwarded" if forwarded else "ignored"}
 
     # Mã nạp mới có dạng Chuyentien_<5 chữ số>; chấp nhận cả ngân hàng bỏ dấu _ hoặc thêm khoảng trắng.
     normalized_content = normalize_payment_text(content)
@@ -1233,7 +1262,8 @@ async def sepay_webhook_post(request: Request) -> dict[str, Any]:
 
     legacy_memo_match = re.search(r"(TG(\d{1,30})_[A-Za-z0-9]+_[A-Za-z0-9]+)", content, re.IGNORECASE)
     if not legacy_memo_match:
-        return {"ok": True, "message": "not a telegram deposit"}
+        forwarded = await forward_sepay_event(payload, request)
+        return {"ok": True, "message": "forwarded" if forwarded else "not a telegram deposit"}
     memo = legacy_memo_match.group(1)
     telegram_id = int(legacy_memo_match.group(2))
     try:
