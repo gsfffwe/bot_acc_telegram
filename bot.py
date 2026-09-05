@@ -55,10 +55,21 @@ load_dotenv(BASE_DIR / ".env")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEB_API_BASE_URL = os.getenv("WEB_API_BASE_URL", "").strip().rstrip("/")
 TELEGRAM_BOT_SHARED_SECRET = os.getenv("TELEGRAM_BOT_SHARED_SECRET", "").strip()
-try:
-    ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0").strip() or "0")
-except ValueError:
-    ADMIN_TELEGRAM_ID = 0
+
+
+def parse_admin_ids() -> set[int]:
+    raw_values = [os.getenv("ADMIN_TELEGRAM_ID", ""), os.getenv("ADMIN_TELEGRAM_IDS", "")]
+    admin_ids: set[int] = set()
+    for raw_value in raw_values:
+        for value in re.split(r"[,;\s]+", raw_value or ""):
+            value = value.strip().strip("'\"")
+            if value.isdigit():
+                admin_ids.add(int(value))
+    return admin_ids
+
+
+ADMIN_TELEGRAM_IDS = parse_admin_ids()
+ADMIN_TELEGRAM_ID = min(ADMIN_TELEGRAM_IDS) if ADMIN_TELEGRAM_IDS else 0
 DATA_DIR = Path(os.getenv("BOT_DATA_DIR", str(BASE_DIR)))
 DB_PATH = DATA_DIR / "telegram_shop.sqlite3"
 PORT = int(os.getenv("PORT", "8000"))
@@ -297,7 +308,7 @@ def vi_time(timestamp: Any) -> str:
 
 def is_admin(telegram_id: int | str) -> bool:
     try:
-        return ADMIN_TELEGRAM_ID > 0 and int(telegram_id) == ADMIN_TELEGRAM_ID
+        return int(telegram_id) in ADMIN_TELEGRAM_IDS
     except (TypeError, ValueError):
         return False
 
@@ -419,16 +430,17 @@ async def handle_api_error(target: Message | CallbackQuery, exc: ApiError) -> No
 
 async def notify_admin(text: str) -> None:
     global bot
-    if not bot or not ADMIN_TELEGRAM_ID:
+    if not bot or not ADMIN_TELEGRAM_IDS:
         return
-    try:
-        await bot.send_message(ADMIN_TELEGRAM_ID, text)
-    except Exception:
-        LOGGER.exception("Could not notify admin")
+    for admin_id in sorted(ADMIN_TELEGRAM_IDS):
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            LOGGER.exception("Could not notify admin %s", admin_id)
 
 
 def public_error_message(exc: ApiError) -> str:
-    """Ẩn chi tiết kỹ thuật/nhà cung cấp khỏi tin nhắn gửi cho khách."""
+    """Ẩn chi tiết kỹ thuật nội bộ khỏi tin nhắn gửi cho khách."""
     if exc.code.startswith("PROVIDER_") or exc.code in {
         "PRODUCT_NOT_PROVIDER",
         "PROVIDER_DISABLED",
@@ -632,8 +644,9 @@ async def start_handler(message: Message, state: FSMContext) -> None:
     touch_user(message.from_user.id)
     await message.answer(
         "🛍 <b>SHOP TÀI KHOẢN</b>\n\n"
-        "Bạn chỉ cần Telegram để mua hàng. Chọn sản phẩm, nạp tiền bằng QR và bot sẽ tự động xử lý rồi gửi tài khoản.\n\n"
-        "Chỉ sử dụng các tài khoản bạn có quyền phân phối và tuân thủ điều khoản của nhà cung cấp.",
+        "Chọn sản phẩm bạn cần, nạp tiền nhanh bằng QR và nhận thông tin ngay sau khi thanh toán thành công.\n\n"
+        "✅ Giao tự động\n"
+        "🔒 Thông tin đơn hàng được bảo mật.",
         reply_markup=main_keyboard(message.from_user.id),
     )
 
@@ -646,7 +659,7 @@ async def help_handler(message: Message) -> None:
         "1. Chọn 📦 Sản phẩm.\n"
         "2. Bấm sản phẩm cần mua.\n"
         "3. Nếu chưa đủ số dư, chọn 💳 Nạp tiền và chuyển khoản đúng nội dung.\n"
-        "4. SePay tự động xác nhận; sau đó bot xử lý và gửi tài khoản cho bạn.\n\n"
+        "4. Hệ thống tự động xác nhận; sau đó bot xử lý và gửi thông tin cho bạn.\n\n"
         "Lệnh: /products, /deposit, /balance, /orders",
         reply_markup=main_keyboard(message.from_user.id),
     )
@@ -698,7 +711,11 @@ async def orders_handler(message: Message) -> None:
 @dp.message(F.text == "🛠 Quản trị")
 async def admin_handler(message: Message) -> None:
     if not is_admin(message.from_user.id):
-        await message.answer("Bạn không có quyền sử dụng mục này.", reply_markup=main_keyboard(message.from_user.id))
+        await message.answer(
+            "Bạn không có quyền sử dụng mục này.\n"
+            f"ID Telegram của tài khoản này: <code>{message.from_user.id}</code>",
+            reply_markup=main_keyboard(message.from_user.id),
+        )
         return
     try:
         data = await api.admin_stats(message.from_user.id)
@@ -825,7 +842,7 @@ async def deposit_amount_handler(message: Message, state: FSMContext) -> None:
             f"Số tài khoản: <code>{html.escape(str(bank.get('account') or ''))}</code>\n"
             f"Chủ tài khoản: <b>{html.escape(str(bank.get('accountName') or ''))}</b>\n"
             f"Nội dung chuyển khoản: <code>{html.escape(memo)}</code>\n\n"
-            "Giữ nguyên số tiền và nội dung chuyển khoản. Bot sẽ tự động cộng tiền sau khi SePay xác nhận."
+            "Giữ nguyên số tiền và nội dung chuyển khoản. Hệ thống sẽ tự động cộng tiền sau khi nhận được thanh toán."
         )
         qr_url = str(data.get("qrUrl") or "")
         if qr_url:
@@ -1068,7 +1085,7 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
         except ApiError as exc:
             if exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
                 await notify_admin(
-                    "⚠️ <b>ĐƠN NGUỒN API CẦN KIỂM TRA</b>\n\n"
+                    "⚠️ <b>ĐƠN HÀNG CẦN KIỂM TRA</b>\n\n"
                     f"👤 Telegram ID: <code>{callback.from_user.id}</code>\n"
                     f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
                     f"📦 Sản phẩm: <b>{html.escape(str(product.get('name') or 'Sản phẩm'))}</b>"
@@ -1146,11 +1163,12 @@ def extract_payment_fields(payload: Any) -> tuple[int, str, str]:
                 break
         except (TypeError, ValueError):
             pass
+    content_parts: list[str] = []
     for key in ("content", "description", "transferContent", "transactionContent", "referenceCode"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
-            content = value.strip()
-            break
+            content_parts.append(value.strip())
+    content = " ".join(dict.fromkeys(content_parts))[:4000]
     for key in ("id", "transaction_id", "transactionId", "reference", "code"):
         value = data.get(key)
         if value is not None and str(value).strip():
@@ -1176,7 +1194,12 @@ async def root() -> dict[str, Any]:
 
 @app.get("/sepay/webhook")
 async def sepay_webhook_get() -> dict[str, Any]:
-    return {"ok": True, "message": "SePay webhook endpoint is alive. Use POST."}
+    return {
+        "ok": True,
+        "message": "SePay webhook endpoint is alive. Use POST.",
+        "memoFormat": "Chuyentien_12345",
+        "acceptsLegacyMemo": True,
+    }
 
 
 @app.post("/sepay/webhook")
@@ -1191,12 +1214,13 @@ async def sepay_webhook_post(request: Request) -> dict[str, Any]:
     if amount <= 0 or not content:
         return {"ok": True, "message": "ignored"}
 
-    # Mã nạp mới có dạng Chuyentien_<5 chữ số>; vẫn nhận mã TG cũ cho giao dịch đang chờ.
-    new_memo_match = re.search(r"(Chuyentien_?\d{5})", content, re.IGNORECASE)
+    # Mã nạp mới có dạng Chuyentien_<5 chữ số>; chấp nhận cả ngân hàng bỏ dấu _ hoặc thêm khoảng trắng.
+    normalized_content = normalize_payment_text(content)
+    new_memo_match = re.search(r"chuyentien(\d{5})(?!\d)", normalized_content, re.IGNORECASE)
     if new_memo_match:
-        suffix_match = re.search(r"(\d{5})$", new_memo_match.group(1))
-        memo = f"Chuyentien_{suffix_match.group(1)}" if suffix_match else ""
+        memo = f"Chuyentien_{new_memo_match.group(1)}"
         try:
+            LOGGER.info("SePay deposit matched Telegram memo %s", memo)
             result = await api.confirm_deposit_by_memo(memo, amount, transaction_id or "sepay")
             if result.get("processed"):
                 telegram_id = int(result.get("telegramId") or 0)
@@ -1240,6 +1264,8 @@ async def main() -> None:
         raise RuntimeError("Thiếu WEB_API_BASE_URL trong biến môi trường.")
     if len(TELEGRAM_BOT_SHARED_SECRET) < 32:
         raise RuntimeError("TELEGRAM_BOT_SHARED_SECRET phải có ít nhất 32 ký tự.")
+    if not ADMIN_TELEGRAM_IDS:
+        LOGGER.warning("No Telegram admin ID configured; /admin will be unavailable.")
     init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.set_my_commands(

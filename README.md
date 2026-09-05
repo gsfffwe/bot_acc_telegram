@@ -50,7 +50,7 @@ Sau đó gửi `/start` cho bot. Khi chạy local, bot nhận tin nhắn Telegra
 
 ## Quản trị
 
-Admin dùng đúng Telegram ID trong `ADMIN_TELEGRAM_ID` rồi gửi `/admin` để xem:
+Admin dùng đúng số Telegram ID (không phải username) trong `ADMIN_TELEGRAM_ID` rồi gửi `/admin` để xem. Bot cũng hỗ trợ thêm nhiều ID bằng `ADMIN_TELEGRAM_IDS`, ngăn cách bằng dấu phẩy:
 
 - số khách Telegram;
 - tổng đơn, đơn hoàn tất và doanh số;
@@ -66,5 +66,7 @@ Bot chạy polling nên cần deploy như một worker/service bằng `Procfile`
 ```text
 https://dia-chi-public-cua-bot/sepay/webhook
 ```
+
+Có thể mở đường dẫn trên bằng trình duyệt để kiểm tra bot đã chạy bản hỗ trợ mã `Chuyentien_12345` hay chưa. Kết quả cần có `memoFormat` và `acceptsLegacyMemo`.
 
 Chỉ dùng bot để phân phối tài khoản mà bạn có quyền bán hoặc phân phối.
