@@ -69,4 +69,6 @@ https://dia-chi-public-cua-bot/sepay/webhook
 
 Có thể mở đường dẫn trên bằng trình duyệt để kiểm tra bot đã chạy bản hỗ trợ mã `Chuyentien_12345` hay chưa. Kết quả cần có `memoFormat` và `acceptsLegacyMemo`.
 
+Nếu dùng chung một tài khoản ngân hàng cho bot bán tài khoản và bot OTP, SePay chỉ cần trỏ tới một URL. Trên bot nhận webhook chính, đặt `SEPAY_FORWARD_URL` bằng URL public của bot còn lại. Hai bot phải dùng cùng `SEPAY_WEBHOOK_TOKEN` nếu biến này được bật. Mỗi bot chỉ xử lý đúng loại đơn của mình, giao dịch chưa khớp sẽ được chuyển tiếp một lần.
+
 Chỉ dùng bot để phân phối tài khoản mà bạn có quyền bán hoặc phân phối.
