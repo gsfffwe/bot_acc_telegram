@@ -99,6 +99,11 @@ class QuantityStates(StatesGroup):
     quantity = State()
 
 
+class AdminStates(StatesGroup):
+    broadcast = State()
+    confirm_broadcast = State()
+
+
 class ApiError(RuntimeError):
     def __init__(self, status: int, code: str, message: str):
         super().__init__(message)
@@ -266,24 +271,60 @@ def init_db() -> None:
             )
             """
         )
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(telegram_users)").fetchall()}
+        if "display_name" not in columns:
+            conn.execute("ALTER TABLE telegram_users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+        if "username" not in columns:
+            conn.execute("ALTER TABLE telegram_users ADD COLUMN username TEXT NOT NULL DEFAULT ''")
 
 
-def touch_user(telegram_id: int) -> None:
+def touch_user(telegram_id: int, display_name: str = "", username: str = "") -> None:
     now = int(time.time())
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute(
             """
-            INSERT INTO telegram_users(telegram_id, first_seen_at, last_seen_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+            INSERT INTO telegram_users(telegram_id, first_seen_at, last_seen_at, display_name, username)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at,
+                display_name = CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE telegram_users.display_name END,
+                username = CASE WHEN excluded.username <> '' THEN excluded.username ELSE telegram_users.username END
             """,
-            (telegram_id, now, now),
+            (telegram_id, now, now, str(display_name or "").strip(), str(username or "").strip()),
         )
+
+
+def remember_user(user: Any) -> None:
+    """Lưu tên hiển thị tối thiểu để admin dễ nhận diện khách trong bot."""
+    if not user or getattr(user, "id", None) is None:
+        return
+    touch_user(
+        int(user.id),
+        str(getattr(user, "full_name", "") or ""),
+        str(getattr(user, "username", "") or ""),
+    )
+
+
+def local_users() -> dict[int, dict[str, Any]]:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        rows = conn.execute(
+            "SELECT telegram_id, display_name, username, last_seen_at FROM telegram_users ORDER BY last_seen_at DESC"
+        ).fetchall()
+    return {
+        int(row[0]): {
+            "displayName": str(row[1] or ""),
+            "username": str(row[2] or ""),
+            "lastSeenAt": row[3],
+        }
+        for row in rows
+    }
 
 
 # ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
+
+UI_DIVIDER = "━━━━━━━━━━━━━━"
 
 def money(value: Any) -> str:
     try:
@@ -299,17 +340,63 @@ def new_order_id() -> str:
     return "DH-" + "".join(secrets.choice(alphabet) for _ in range(8))
 
 
-def support_line() -> str:
-    return f"🆘 Hỗ trợ: <code>{html.escape(SUPPORT_HANDLE)}</code>"
-
-
 def support_url() -> str:
     return f"https://t.me/{SUPPORT_HANDLE.lstrip('@')}"
+
+
+def support_link() -> str:
+    """Liên kết mở thẳng cuộc trò chuyện hỗ trợ, không dùng dạng mã sao chép."""
+    return (
+        f'<a href="{html.escape(support_url(), quote=True)}">'
+        f"{html.escape(SUPPORT_HANDLE)}"
+        "</a>"
+    )
+
+
+def support_line() -> str:
+    return f"🆘 Hỗ trợ: {support_link()}"
+
+
+def order_status_icon(status: Any) -> str:
+    normalized = str(status or "").strip().lower()
+    if any(value in normalized for value in ("hoàn thành", "thành công", "completed", "success")):
+        return "✅"
+    if any(value in normalized for value in ("hủy", "huỷ", "lỗi", "failed", "cancel")):
+        return "❌"
+    return "⏳"
 
 
 def short_text(value: Any, length: int = 30) -> str:
     text = " ".join(str(value or "").split())
     return text if len(text) <= length else text[: max(1, length - 1)] + "…"
+
+
+def product_warranty(product: dict[str, Any]) -> str:
+    """Chuẩn hóa bảo hành theo cùng cách hiển thị của website."""
+    if not product:
+        return "Không bảo hành"
+
+    raw_warranty = str(product.get("warranty") or "").strip()
+    normalized = raw_warranty.casefold()
+    if raw_warranty and normalized not in {"không bảo hành", "khong bao hanh", "none", "no", "-"}:
+        if re.match(r"^bảo hành\b", raw_warranty, re.IGNORECASE):
+            return raw_warranty
+        return f"Bảo hành {raw_warranty}"
+
+    try:
+        warranty_days = float(product.get("warrantyDays") or 0)
+    except (TypeError, ValueError):
+        warranty_days = 0
+    if warranty_days > 0:
+        days = int(warranty_days) if warranty_days.is_integer() else warranty_days
+        return f"Bảo hành {days:g} ngày"
+
+    desc = str(product.get("desc") or "")
+    match = re.search(r"bảo hành\s*[:\-]?\s*([^.,;\n]+)", desc, re.IGNORECASE)
+    if match:
+        value = match.group(0).strip()
+        return value if re.match(r"^bảo hành\b", value, re.IGNORECASE) else f"Bảo hành {value}"
+    return "Không bảo hành"
 
 
 def vi_time(timestamp: Any) -> str:
@@ -322,6 +409,13 @@ def vi_time(timestamp: Any) -> str:
         return "Không rõ thời gian"
 
 
+def timestamp_value(timestamp: Any) -> float:
+    try:
+        return float(timestamp or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def is_admin(telegram_id: int | str) -> bool:
     try:
         return int(telegram_id) in ADMIN_TELEGRAM_IDS
@@ -331,9 +425,9 @@ def is_admin(telegram_id: int | str) -> bool:
 
 def main_keyboard(telegram_id: int | None = None) -> ReplyKeyboardMarkup:
     rows = [
-            [KeyboardButton(text="📦 Sản phẩm"), KeyboardButton(text="💰 Số dư")],
-            [KeyboardButton(text="💳 Nạp tiền"), KeyboardButton(text="🧾 Đơn hàng")],
-            [KeyboardButton(text="ℹ️ Trợ giúp")],
+        [KeyboardButton(text="📦 Sản phẩm"), KeyboardButton(text="💰 Số dư")],
+        [KeyboardButton(text="💳 Nạp tiền"), KeyboardButton(text="🧾 Đơn hàng")],
+        [KeyboardButton(text="ℹ️ Trợ giúp"), KeyboardButton(text="🆘 Hỗ trợ")],
     ]
     if telegram_id is not None and is_admin(telegram_id):
         rows.append([KeyboardButton(text="🛠 Quản trị")])
@@ -346,16 +440,56 @@ def main_keyboard(telegram_id: int | None = None) -> ReplyKeyboardMarkup:
 
 def back_to_products_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="📦 Xem sản phẩm", callback_data="products")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Xem sản phẩm", callback_data="products")],
+            [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+        ]
+    )
+
+
+def home_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Xem sản phẩm", callback_data="products")],
+            [
+                InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
+                InlineKeyboardButton(text="💰 Số dư", callback_data="balance"),
+            ],
+            [
+                InlineKeyboardButton(text="🧾 Đơn hàng", callback_data="orders"),
+                InlineKeyboardButton(text="ℹ️ Hướng dẫn", callback_data="help"),
+            ],
+            [InlineKeyboardButton(text="🆘 Liên hệ hỗ trợ", url=support_url())],
+        ]
+    )
+
+
+def utility_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📦 Sản phẩm", callback_data="products"),
+                InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
+            ],
+            [
+                InlineKeyboardButton(text="🧾 Đơn hàng", callback_data="orders"),
+                InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+            ],
+        ]
     )
 
 
 def after_purchase_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📦 Mua sản phẩm khác", callback_data="products")],
-            [InlineKeyboardButton(text="💰 Xem số dư", callback_data="balance")],
-            [InlineKeyboardButton(text="🧾 Xem đơn hàng", callback_data="orders")],
+            [
+                InlineKeyboardButton(text="📦 Mua tiếp", callback_data="products"),
+                InlineKeyboardButton(text="💰 Số dư", callback_data="balance"),
+            ],
+            [
+                InlineKeyboardButton(text="🧾 Đơn hàng", callback_data="orders"),
+                InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+            ],
             [InlineKeyboardButton(text="🆘 Hỗ trợ", url=support_url())],
         ]
     )
@@ -375,9 +509,9 @@ def catalog_keyboard(menu: CatalogMenu, page: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for index, product in enumerate(menu.products[start : start + CATALOG_PAGE_SIZE], start=start):
         stock = int(product.get("quantity") or 0)
-        stock_text = f"còn {stock}" if stock > 0 else "hết hàng"
+        stock_text = f"🟢 {stock}" if stock > 0 else "🔴 hết"
         duration = short_text(product.get("duration") or "Dùng ngay", 14)
-        label = f"{short_text(product.get('name'), 22)} · {duration} · {money(product.get('finalPrice', product.get('price')))} · {stock_text}"
+        label = f"{short_text(product.get('name'), 20)} · {money(product.get('finalPrice', product.get('price')))} · {stock_text}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"product|{menu.key}|{index}")])
 
     nav: list[InlineKeyboardButton] = []
@@ -387,7 +521,12 @@ def catalog_keyboard(menu: CatalogMenu, page: int) -> InlineKeyboardMarkup:
         nav.append(InlineKeyboardButton(text="Sau ›", callback_data=f"catalog|{menu.key}|{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(text="🔄 Làm mới", callback_data="products")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="🔄 Làm mới", callback_data="products"),
+            InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -396,7 +535,7 @@ def product_text(product: dict[str, Any], discount_percent: int) -> str:
     desc = html.escape(str(product.get("desc") or "").strip())
     duration = html.escape(str(product.get("duration") or "Dùng ngay"))
     fmt = html.escape(str(product.get("format") or "Theo mô tả sản phẩm"))
-    warranty = html.escape(str(product.get("warranty") or "Không bảo hành"))
+    warranty = html.escape(product_warranty(product))
     stock = int(product.get("quantity") or 0)
     price = money(product.get("finalPrice", product.get("price")))
     old_price = money(product.get("price"))
@@ -405,9 +544,10 @@ def product_text(product: dict[str, Any], discount_percent: int) -> str:
         price_line += f" <s>{old_price}</s> (-{discount_percent}%)"
     lines = [
         f"📦 <b>{name}</b>",
+        UI_DIVIDER,
         "",
         price_line,
-        f"📊 Kho: <b>{stock}</b>",
+        f"📦 Tình trạng: <b>{stock} tài khoản</b>" if stock > 0 else "📦 Tình trạng: <b>Hết hàng</b>",
         f"⏳ Thời hạn: {duration}",
         f"🧾 Định dạng: <code>{fmt}</code>",
         f"🛡 Bảo hành: {warranty}",
@@ -421,18 +561,50 @@ def product_detail_keyboard(menu: CatalogMenu, index: int, product: dict[str, An
     stock = int(product.get("quantity") or 0)
     rows: list[list[InlineKeyboardButton]] = []
     if stock > 0:
-        rows.append([InlineKeyboardButton(text="🛒 Mua 1 tài khoản", callback_data=f"confirm|{menu.key}|{index}|1")])
-        rows.append([InlineKeyboardButton(text="🔢 Chọn số lượng", callback_data=f"quantity|{menu.key}|{index}")])
+        rows.append(
+            [
+                InlineKeyboardButton(text="🛒 Mua ngay", callback_data=f"confirm|{menu.key}|{index}|1"),
+                InlineKeyboardButton(text="🔢 Số lượng", callback_data=f"quantity|{menu.key}|{index}"),
+            ]
+        )
     else:
         rows.append([InlineKeyboardButton(text="⚠️ Hết hàng", callback_data=f"catalog|{menu.key}|{index // CATALOG_PAGE_SIZE}")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
+            InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+        ]
+    )
     rows.append([InlineKeyboardButton(text="‹ Quay lại danh sách", callback_data=f"catalog|{menu.key}|{index // CATALOG_PAGE_SIZE}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def answer_in_chunks(message: Message, text: str, reply_markup: Any = None) -> None:
-    chunks = [text[i : i + 3900] for i in range(0, len(text), 3900)] or [""]
+    chunks = split_text_lines(text)
     for index, chunk in enumerate(chunks):
         await message.answer(chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None)
+
+
+def split_text_lines(text: str, max_length: int = 3900) -> list[str]:
+    """Chia văn bản theo dòng để không cắt giữa thẻ HTML của Telegram."""
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if current and len(current) + len(line) > max_length:
+            chunks.append(current.rstrip("\n"))
+            current = ""
+        if len(line) > max_length:
+            for start in range(0, len(line), max_length):
+                part = line[start : start + max_length]
+                if current:
+                    chunks.append(current.rstrip("\n"))
+                    current = ""
+                chunks.append(part.rstrip("\n"))
+        else:
+            current += line
+    if current:
+        chunks.append(current.rstrip("\n"))
+    return chunks or [""]
 
 
 async def handle_api_error(target: Message | CallbackQuery, exc: ApiError) -> None:
@@ -462,8 +634,25 @@ def public_error_message(exc: ApiError) -> str:
         "PRODUCT_NOT_PROVIDER",
         "PROVIDER_DISABLED",
     }:
-        return "Sản phẩm tạm thời chưa thể xử lý. Vui lòng thử lại sau hoặc liên hệ hỗ trợ."
+        return "Sản phẩm tạm thời chưa thể xử lý. Vui lòng thử lại sau hoặc liên hệ hỗ trợ.\n\n" + support_line()
     return exc.message
+
+
+def admin_error_message(exc: ApiError) -> str:
+    """Thông báo nội bộ đã rút gọn, không đẩy giá vốn/phản hồi thô lên Telegram."""
+    if exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
+        return "Hệ thống nhận phản hồi không rõ từ bên giao hàng; đơn cần được kiểm tra thủ công."
+    if exc.code.startswith("PROVIDER_"):
+        return "Đơn không thể hoàn tất tự động; tiền đã được hoàn về số dư khách."
+    return "Yêu cầu thất bại; vui lòng kiểm tra log hệ thống để biết chi tiết."
+
+
+def admin_error_code(exc: ApiError) -> str:
+    if exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
+        return "ORDER_REVIEW"
+    if exc.code.startswith("PROVIDER_"):
+        return "DELIVERY_FAILED"
+    return "SYSTEM_ERROR"
 
 
 async def notify_admin_order_with_accounts(
@@ -589,12 +778,18 @@ async def resume_pending_purchase(telegram_id: int, pending: PendingPurchase) ->
             pending.order_id,
         )
     except ApiError as exc:
+        LOGGER.warning(
+            "Checkout failed for order %s (%s): %s",
+            pending.order_id,
+            exc.code,
+            exc.message,
+        )
         await notify_admin(
             "⚠️ <b>ĐƠN HÀNG CẦN KIỂM TRA</b>\n\n"
             f"👤 Telegram ID: <code>{telegram_id}</code>\n"
             f"🧾 Mã đơn: <code>{html.escape(pending.order_id)}</code>\n"
-            f"📌 Mã lỗi: <code>{html.escape(exc.code)}</code>\n"
-            f"{html.escape(exc.message)}"
+            f"📌 Mã xử lý: <code>{admin_error_code(exc)}</code>\n"
+            f"{html.escape(admin_error_message(exc))}"
         )
         if bot:
             if exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
@@ -624,10 +819,60 @@ def parse_amount(text: str) -> int:
 # Catalog / ví / đơn hàng
 # ---------------------------------------------------------------------------
 
-async def show_catalog(message: Message, *, edit: bool = False) -> None:
+def catalog_text(menu: CatalogMenu, page: int) -> str:
+    total_pages = max(1, (len(menu.products) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    return (
+        "📦 <b>DANH MỤC SẢN PHẨM</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"🛒 {len(menu.products)} sản phẩm · Trang <b>{page + 1}/{total_pages}</b>\n\n"
+        "Chọn sản phẩm để xem thông tin, thời hạn và mua tự động."
+    )
+
+
+async def show_home(
+    message: Message,
+    *,
+    edit: bool = False,
+    telegram_id: int | None = None,
+    display_name: str | None = None,
+) -> None:
+    user_id = telegram_id or message.from_user.id
+    if telegram_id is None:
+        remember_user(message.from_user)
+    else:
+        touch_user(user_id, display_name or "")
+    balance_label = "Đang cập nhật"
     try:
-        touch_user(message.from_user.id)
-        data = await api.catalog(message.from_user.id)
+        data = await api.balance(user_id)
+        balance_label = money(data.get("balance"))
+    except ApiError as exc:
+        LOGGER.warning("Could not load balance for home screen: %s", exc.code)
+
+    name = html.escape(short_text(display_name or message.from_user.full_name or "bạn", 32))
+    text = (
+        "🛍 <b>SHOP TÀI KHOẢN</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"👋 Xin chào <b>{name}</b>\n\n"
+        f"💰 Số dư hiện tại: <b>{balance_label}</b>\n"
+        "⚡ Giao thông tin tự động sau khi thanh toán\n"
+        "🔒 Đơn hàng và thông tin tài khoản được bảo mật\n\n"
+        "Chọn một chức năng bên dưới để bắt đầu.\n\n"
+        f"{support_line()}"
+    )
+    if edit:
+        await message.edit_text(text, reply_markup=home_inline_keyboard())
+    else:
+        await message.answer(text, reply_markup=main_keyboard(user_id))
+
+async def show_catalog(message: Message, *, edit: bool = False, telegram_id: int | None = None) -> None:
+    try:
+        user_id = telegram_id or message.from_user.id
+        if telegram_id is None:
+            remember_user(message.from_user)
+        else:
+            touch_user(user_id)
+        data = await api.catalog(user_id)
         products = [item for item in data.get("products", []) if isinstance(item, dict)]
         menu = CatalogMenu(
             key=secrets.token_hex(3),
@@ -635,19 +880,19 @@ async def show_catalog(message: Message, *, edit: bool = False) -> None:
             discount_percent=int(data.get("discountPercent") or 0),
             created_at=time.time(),
         )
-        menus[message.from_user.id] = menu
+        menus[user_id] = menu
         if not products:
-            text = "📦 Hiện chưa có sản phẩm nào đang mở bán."
+            text = (
+                "📦 <b>CHƯA CÓ SẢN PHẨM</b>\n"
+                f"{UI_DIVIDER}\n"
+                "Hiện chưa có sản phẩm phù hợp để hiển thị. Vui lòng thử làm mới sau."
+            )
             if edit:
                 await message.edit_text(text, reply_markup=back_to_products_keyboard())
             else:
-                await message.answer(text, reply_markup=main_keyboard(message.from_user.id))
+                await message.answer(text, reply_markup=main_keyboard(user_id))
             return
-        total_pages = max(1, (len(products) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
-        text = (
-            f"📦 <b>DANH SÁCH SẢN PHẨM</b> · {len(products)} sản phẩm\n"
-            f"Trang 1/{total_pages}\n\nChọn sản phẩm để xem chi tiết và mua tự động."
-        )
+        text = catalog_text(menu, 0)
         markup = catalog_keyboard(menu, 0)
         if edit:
             await message.edit_text(text, reply_markup=markup)
@@ -660,29 +905,63 @@ async def show_catalog(message: Message, *, edit: bool = False) -> None:
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    touch_user(message.from_user.id)
-    await message.answer(
-        "🛍 <b>SHOP TÀI KHOẢN</b>\n\n"
-        "Chọn sản phẩm bạn cần, nạp tiền nhanh bằng QR và nhận thông tin ngay sau khi thanh toán thành công.\n\n"
-        "✅ Giao tự động\n"
-        "🔒 Thông tin đơn hàng được bảo mật.\n\n"
-        f"{support_line()}",
-        reply_markup=main_keyboard(message.from_user.id),
-    )
+    await show_home(message)
+
+
+@dp.message(Command("home"))
+async def home_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await show_home(message)
 
 
 @dp.message(Command("help"))
 @dp.message(F.text == "ℹ️ Trợ giúp")
 async def help_handler(message: Message) -> None:
+    remember_user(message.from_user)
     await message.answer(
-        "ℹ️ <b>Hướng dẫn</b>\n\n"
-        "1. Chọn 📦 Sản phẩm.\n"
-        "2. Bấm sản phẩm cần mua.\n"
-        "3. Nếu chưa đủ số dư, chọn 💳 Nạp tiền và chuyển khoản đúng nội dung.\n"
-        "4. Hệ thống tự động xác nhận; sau đó bot xử lý và gửi thông tin cho bạn.\n\n"
-        "Lệnh: /products, /deposit, /balance, /orders\n\n"
+        "ℹ️ <b>HƯỚNG DẪN MUA HÀNG</b>\n"
+        f"{UI_DIVIDER}\n"
+        "1️⃣ Mở 📦 <b>Sản phẩm</b> và chọn gói bạn cần.\n"
+        "2️⃣ Bấm <b>Mua ngay</b> hoặc nhập số lượng.\n"
+        "3️⃣ Nếu chưa đủ số dư, mở 💳 <b>Nạp tiền</b> và chuyển khoản đúng số tiền/nội dung.\n"
+        "4️⃣ Hệ thống tự xác nhận, xử lý đơn và gửi thông tin tài khoản.\n\n"
+        "Bạn có thể dùng các nút menu hoặc lệnh /products, /deposit, /balance, /orders.\n\n"
         f"{support_line()}",
-        reply_markup=main_keyboard(message.from_user.id),
+        reply_markup=utility_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "help")
+async def help_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            "ℹ️ <b>HƯỚNG DẪN MUA HÀNG</b>\n"
+            f"{UI_DIVIDER}\n"
+            "1️⃣ Chọn sản phẩm và kiểm tra thời hạn, số lượng còn lại.\n"
+            "2️⃣ Bấm <b>Mua ngay</b> hoặc nhập số lượng cần mua.\n"
+            "3️⃣ Nạp tiền bằng QR nếu số dư chưa đủ.\n"
+            "4️⃣ Sau khi thanh toán, bot tự xử lý và gửi thông tin đơn hàng.\n\n"
+            f"{support_line()}",
+            reply_markup=home_inline_keyboard(),
+        )
+
+
+@dp.message(Command("support"))
+@dp.message(F.text == "🆘 Hỗ trợ")
+async def support_handler(message: Message) -> None:
+    remember_user(message.from_user)
+    await message.answer(
+        "🆘 <b>HỖ TRỢ KHÁCH HÀNG</b>\n"
+        f"{UI_DIVIDER}\n"
+        "Nếu cần kiểm tra đơn, nạp tiền hoặc gặp lỗi khi nhận hàng, hãy liên hệ hỗ trợ và gửi mã đơn cho admin.\n\n"
+        f"{support_line()}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Mở chat hỗ trợ", url=support_url())],
+                [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+            ]
+        ),
     )
 
 
@@ -694,13 +973,20 @@ async def products_handler(message: Message) -> None:
 
 @dp.message(Command("balance"))
 @dp.message(F.text == "💰 Số dư")
-async def balance_handler(message: Message) -> None:
+async def balance_handler(message: Message, telegram_id: int | None = None) -> None:
     try:
-        data = await api.balance(message.from_user.id)
+        user_id = telegram_id or message.from_user.id
+        if telegram_id is None:
+            remember_user(message.from_user)
+        else:
+            touch_user(user_id)
+        data = await api.balance(user_id)
         await message.answer(
-            "💰 <b>SỐ DƯ CỦA BẠN</b>\n\n"
-            f"Số dư: <b>{money(data.get('balance'))}</b>",
-            reply_markup=main_keyboard(message.from_user.id),
+            "💰 <b>SỐ DƯ CỦA BẠN</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"Ví hiện tại: <b>{money(data.get('balance'))}</b>\n\n"
+            "Bạn có thể dùng số dư này để mua sản phẩm trong shop.",
+            reply_markup=utility_keyboard(),
         )
     except ApiError as exc:
         await handle_api_error(message, exc)
@@ -708,24 +994,165 @@ async def balance_handler(message: Message) -> None:
 
 @dp.message(Command("orders"))
 @dp.message(F.text == "🧾 Đơn hàng")
-async def orders_handler(message: Message) -> None:
+async def orders_handler(message: Message, telegram_id: int | None = None) -> None:
     try:
-        data = await api.orders(message.from_user.id)
+        user_id = telegram_id or message.from_user.id
+        if telegram_id is None:
+            remember_user(message.from_user)
+        else:
+            touch_user(user_id)
+        data = await api.orders(user_id)
         orders = [item for item in data.get("orders", []) if isinstance(item, dict)]
         if not orders:
-            await message.answer("🧾 Bạn chưa có đơn hàng nào.", reply_markup=main_keyboard(message.from_user.id))
+            await message.answer(
+                "🧾 <b>LỊCH SỬ ĐƠN HÀNG</b>\n"
+                f"{UI_DIVIDER}\n"
+                "Bạn chưa có đơn hàng nào.",
+                reply_markup=utility_keyboard(),
+            )
             return
-        lines = ["🧾 <b>LỊCH SỬ ĐƠN HÀNG</b>", ""]
+        lines = ["🧾 <b>LỊCH SỬ ĐƠN HÀNG</b>", UI_DIVIDER, ""]
         for index, order in enumerate(orders[:10], start=1):
+            status = str(order.get("status") or "Đang xử lý")
             lines.append(
                 f"<b>{index}.</b> <code>{html.escape(str(order.get('orderId') or ''))}</code>\n"
                 f"📦 {html.escape(str(order.get('productName') or 'Sản phẩm'))}\n"
                 f"💵 {money(order.get('price'))} · SL {int(order.get('quantity') or 1)}\n"
-                f"📌 {html.escape(str(order.get('status') or 'Đang xử lý'))} · {vi_time(order.get('timestamp'))}\n"
+                f"{order_status_icon(status)} {html.escape(status)} · {vi_time(order.get('timestamp'))}\n"
             )
-        await answer_in_chunks(message, "\n".join(lines), main_keyboard(message.from_user.id))
+        await answer_in_chunks(message, "\n".join(lines), main_keyboard(user_id))
     except ApiError as exc:
         await handle_api_error(message, exc)
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Làm mới thống kê", callback_data="admin_dashboard")],
+            [InlineKeyboardButton(text="👥 Danh sách khách hàng", callback_data="admin_users")],
+            [InlineKeyboardButton(text="📣 Gửi thông báo", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+        ]
+    )
+
+
+def admin_broadcast_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Gửi đến khách hàng", callback_data="admin_broadcast_confirm"),
+                InlineKeyboardButton(text="❌ Hủy", callback_data="admin_broadcast_cancel"),
+            ]
+        ]
+    )
+
+
+async def begin_admin_broadcast(message: Message, state: FSMContext, admin_id: int) -> None:
+    if not is_admin(admin_id):
+        await message.answer(
+            "Bạn không có quyền sử dụng chức năng gửi thông báo.",
+            reply_markup=main_keyboard(admin_id),
+        )
+        return
+    await state.clear()
+    await state.set_state(AdminStates.broadcast)
+    await message.answer(
+        "📣 <b>GỬI THÔNG BÁO CHO KHÁCH</b>\n"
+        f"{UI_DIVIDER}\n"
+        "Gửi một trong các dạng sau:\n"
+        "• Tin nhắn văn bản\n"
+        "• Ảnh kèm hoặc không kèm chú thích\n"
+        "• Video kèm hoặc không kèm chú thích\n\n"
+        "Bot sẽ hiển thị bản xem trước để bạn xác nhận trước khi gửi.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Hủy", callback_data="admin_broadcast_cancel")]]
+        ),
+    )
+
+
+async def admin_dashboard_text(admin_id: int) -> str:
+    data = await api.admin_stats(admin_id)
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    customers = [item for item in data.get("customers", []) if isinstance(item, dict)]
+    lines = [
+        "🛠 <b>QUẢN TRỊ SHOP</b>",
+        UI_DIVIDER,
+        f"👥 Khách hàng: <b>{int(summary.get('customers') or 0)}</b>",
+        f"🧾 Tổng đơn: <b>{int(summary.get('orders') or 0)}</b>",
+        f"✅ Đơn hoàn tất: <b>{int(summary.get('completedOrders') or 0)}</b>",
+        f"💰 Doanh số: <b>{money(summary.get('revenue'))}</b>",
+        f"💳 Lượt nạp thành công: <b>{int(summary.get('deposits') or 0)}</b>",
+        f"📥 Tổng tiền đã nạp: <b>{money(summary.get('depositedAmount'))}</b>",
+        f"💼 Tổng số dư khách: <b>{money(summary.get('balances'))}</b>",
+        "",
+        "<b>Khách hoạt động gần đây</b>",
+    ]
+    if not customers:
+        lines.append("Chưa có dữ liệu khách hàng.")
+    else:
+        for index, customer in enumerate(customers[:15], start=1):
+            lines.append(
+                f"{index}. <code>{html.escape(str(customer.get('telegramId') or ''))}</code> · "
+                f"đơn {int(customer.get('completedOrders') or 0)}/{int(customer.get('orders') or 0)} · "
+                f"chi {money(customer.get('spent'))} · dư {money(customer.get('balance'))}\n"
+                f"   Hoạt động: {vi_time(customer.get('lastSeenAt'))}"
+            )
+    return "\n".join(lines)
+
+
+async def admin_users_text(admin_id: int) -> str:
+    data = await api.admin_stats(admin_id)
+    customers = [item for item in data.get("customers", []) if isinstance(item, dict)]
+    local = local_users()
+    merged: dict[int, dict[str, Any]] = {}
+
+    for customer in customers:
+        try:
+            user_id = int(customer.get("telegramId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if user_id > 0:
+            merged[user_id] = {**local.get(user_id, {}), **customer}
+
+    for user_id, record in local.items():
+        merged.setdefault(user_id, record)
+
+    rows = sorted(
+        merged.items(),
+        key=lambda item: timestamp_value(item[1].get("lastSeenAt")),
+        reverse=True,
+    )
+    lines = [
+        "👥 <b>DANH SÁCH KHÁCH HÀNG</b>",
+        UI_DIVIDER,
+        f"Tổng số đã ghi nhận: <b>{len(rows)}</b>",
+        "",
+    ]
+    if not rows:
+        lines.append("Chưa có khách hàng nào sử dụng bot.")
+    else:
+        for index, (user_id, record) in enumerate(rows[:50], start=1):
+            display_name = str(
+                record.get("displayName")
+                or record.get("name")
+                or record.get("fullName")
+                or "Khách chưa cập nhật tên"
+            ).strip()
+            username = str(record.get("username") or "").strip().lstrip("@")
+            if username and username.lower() not in display_name.lower():
+                display_name += f" · @{username}"
+            balance_value = record.get("balance")
+            balance_text = money(balance_value) if balance_value is not None else "Chưa đồng bộ"
+            status = str(record.get("status") or "")
+            status_line = f" · {html.escape(status)}" if status else ""
+            lines.append(
+                f"<b>{index}. {html.escape(display_name)}</b>\n"
+                f"   ID: <code>{user_id}</code> · Số dư: <b>{balance_text}</b>{status_line}\n"
+                f"   Hoạt động: {vi_time(record.get('lastSeenAt'))}"
+            )
+    if len(rows) > 50:
+        lines.extend(["", f"… còn {len(rows) - 50} khách hàng khác."])
+    return "\n".join(lines)
 
 
 @dp.message(Command("admin"))
@@ -739,35 +1166,205 @@ async def admin_handler(message: Message) -> None:
         )
         return
     try:
-        data = await api.admin_stats(message.from_user.id)
-        summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
-        customers = [item for item in data.get("customers", []) if isinstance(item, dict)]
-        lines = [
-            "🛠 <b>QUẢN TRỊ SHOP</b>",
-            "",
-            f"👥 Khách hàng: <b>{int(summary.get('customers') or 0)}</b>",
-            f"🧾 Tổng đơn: <b>{int(summary.get('orders') or 0)}</b>",
-            f"✅ Đơn hoàn tất: <b>{int(summary.get('completedOrders') or 0)}</b>",
-            f"💰 Doanh số: <b>{money(summary.get('revenue'))}</b>",
-            f"💳 Lượt nạp thành công: <b>{int(summary.get('deposits') or 0)}</b>",
-            f"📥 Tổng tiền đã nạp: <b>{money(summary.get('depositedAmount'))}</b>",
-            f"💼 Tổng số dư khách: <b>{money(summary.get('balances'))}</b>",
-            "",
-            "<b>Khách hoạt động gần đây</b>",
-        ]
-        if not customers:
-            lines.append("Chưa có dữ liệu khách hàng.")
-        else:
-            for index, customer in enumerate(customers[:15], start=1):
-                lines.append(
-                    f"{index}. <code>{html.escape(str(customer.get('telegramId') or ''))}</code> · "
-                    f"đơn {int(customer.get('completedOrders') or 0)}/{int(customer.get('orders') or 0)} · "
-                    f"chi {money(customer.get('spent'))} · dư {money(customer.get('balance'))}\n"
-                    f"   Hoạt động: {vi_time(customer.get('lastSeenAt'))}"
-                )
-        await answer_in_chunks(message, "\n".join(lines), main_keyboard(message.from_user.id))
+        await message.answer(
+            await admin_dashboard_text(message.from_user.id),
+            reply_markup=admin_keyboard(),
+        )
     except ApiError as exc:
         await handle_api_error(message, exc)
+
+
+@dp.callback_query(F.data == "admin_dashboard")
+async def admin_dashboard_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    try:
+        if callback.message:
+            await callback.message.edit_text(
+                await admin_dashboard_text(callback.from_user.id),
+                reply_markup=admin_keyboard(),
+            )
+        await callback.answer("Đã cập nhật thống kê.")
+    except ApiError as exc:
+        await callback.answer(public_error_message(exc)[:180], show_alert=True)
+
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    try:
+        text = await admin_users_text(callback.from_user.id)
+        if callback.message:
+            chunks = split_text_lines(text)
+            await callback.message.edit_text(chunks[0], reply_markup=admin_keyboard() if len(chunks) == 1 else None)
+            for chunk in chunks[1:-1]:
+                await callback.message.answer(chunk)
+            if len(chunks) > 1:
+                await callback.message.answer(chunks[-1], reply_markup=admin_keyboard())
+        await callback.answer()
+    except ApiError as exc:
+        await callback.answer(public_error_message(exc)[:180], show_alert=True)
+
+
+@dp.message(Command("users"))
+async def users_command_handler(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            "Bạn không có quyền xem danh sách khách hàng.",
+            reply_markup=main_keyboard(message.from_user.id),
+        )
+        return
+    try:
+        await answer_in_chunks(message, await admin_users_text(message.from_user.id), admin_keyboard())
+    except ApiError as exc:
+        await handle_api_error(message, exc)
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        await begin_admin_broadcast(callback.message, state, callback.from_user.id)
+
+
+@dp.message(Command("broadcast"))
+async def broadcast_command_handler(message: Message, state: FSMContext) -> None:
+    await begin_admin_broadcast(message, state, message.from_user.id)
+
+
+@dp.message(AdminStates.broadcast)
+async def admin_broadcast_message_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    kind = ""
+    file_id = ""
+    content = ""
+    if message.photo:
+        kind = "photo"
+        file_id = message.photo[-1].file_id
+        content = str(message.caption or "").strip()
+    elif message.video:
+        kind = "video"
+        file_id = message.video.file_id
+        content = str(message.caption or "").strip()
+    elif message.text:
+        kind = "text"
+        content = message.text
+    else:
+        await message.answer("Chỉ hỗ trợ tin nhắn văn bản, ảnh hoặc video. Vui lòng gửi lại.")
+        return
+    if kind in {"photo", "video"} and len(content) > 1024:
+        await message.answer("Chú thích ảnh/video tối đa 1024 ký tự. Vui lòng gửi lại nội dung ngắn hơn.")
+        return
+
+    await state.update_data(kind=kind, file_id=file_id, content=content)
+    await state.set_state(AdminStates.confirm_broadcast)
+    type_label = {"text": "Tin nhắn văn bản", "photo": "Ảnh", "video": "Video"}[kind]
+    preview = content[:1200] if content else "(Không có nội dung chú thích)"
+    await message.answer(
+        "📣 <b>XEM TRƯỚC THÔNG BÁO</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"Loại: <b>{type_label}</b>\n"
+        f"Nội dung:\n<pre>{html.escape(preview)}</pre>\n"
+        "Nếu đúng, bấm gửi để phát đến toàn bộ khách đã từng dùng bot.",
+        reply_markup=admin_broadcast_keyboard(),
+    )
+
+
+async def broadcast_recipient_ids(admin_id: int) -> list[int]:
+    recipients = set(local_users())
+    try:
+        data = await api.admin_stats(admin_id)
+        customers = data.get("customers", [])
+        for customer in customers if isinstance(customers, list) else []:
+            if not isinstance(customer, dict):
+                continue
+            try:
+                user_id = int(customer.get("telegramId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if user_id > 0:
+                recipients.add(user_id)
+    except ApiError as exc:
+        LOGGER.warning("Could not load backend customers for broadcast: %s", exc.code)
+    return sorted(user_id for user_id in recipients if not is_admin(user_id))
+
+
+async def broadcast_payload(payload: dict[str, Any], admin_id: int) -> tuple[int, int]:
+    global bot
+    if not bot:
+        return 0, 0
+    sent = 0
+    failed = 0
+    for user_id in await broadcast_recipient_ids(admin_id):
+        try:
+            kind = str(payload.get("kind") or "")
+            content = str(payload.get("content") or "")
+            if kind == "photo":
+                await bot.send_photo(
+                    user_id,
+                    photo=str(payload.get("file_id") or ""),
+                    caption=content or None,
+                    parse_mode=None,
+                )
+            elif kind == "video":
+                await bot.send_video(
+                    user_id,
+                    video=str(payload.get("file_id") or ""),
+                    caption=content or None,
+                    parse_mode=None,
+                )
+            else:
+                await bot.send_message(user_id, content, parse_mode=None)
+            sent += 1
+        except Exception:
+            failed += 1
+            LOGGER.warning("Could not broadcast to Telegram user %s", user_id)
+        await asyncio.sleep(0.06)
+    return sent, failed
+
+
+@dp.callback_query(F.data == "admin_broadcast_confirm")
+async def admin_broadcast_confirm_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    payload = await state.get_data()
+    if not payload.get("kind"):
+        await state.clear()
+        await callback.answer("Nội dung thông báo đã hết hạn.", show_alert=True)
+        return
+    await callback.answer("Đang gửi thông báo…")
+    if callback.message:
+        await callback.message.edit_text("⏳ <b>ĐANG GỬI THÔNG BÁO…</b>\nVui lòng chờ bot hoàn tất.")
+    sent, failed = await broadcast_payload(payload, callback.from_user.id)
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(
+            "✅ <b>ĐÃ GỬI THÔNG BÁO</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"Gửi thành công: <b>{sent}</b>\n"
+            f"Không gửi được: <b>{failed}</b>",
+            reply_markup=admin_keyboard(),
+        )
+
+
+@dp.callback_query(F.data == "admin_broadcast_cancel")
+async def admin_broadcast_cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Đã hủy.")
+    if callback.message:
+        await callback.message.edit_text("Đã hủy gửi thông báo.", reply_markup=admin_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -797,12 +1394,20 @@ async def notify_deposit_paid(telegram_id: int, data: dict[str, Any]) -> None:
     pending_note = "\n\n⏳ Bot sẽ tự động tiếp tục đơn hàng bạn vừa chọn." if pending else ""
     await bot.send_message(
         telegram_id,
-        "✅ <b>NẠP TIỀN THÀNH CÔNG</b>\n\n"
+        "✅ <b>NẠP TIỀN THÀNH CÔNG</b>\n"
+        f"{UI_DIVIDER}\n\n"
         f"Đã cộng: <b>+{money(data.get('amount'))}</b>\n"
         f"Số dư mới: <b>{money(data.get('balance'))}</b>\n"
-        f"Mã nạp: <code>{html.escape(memo)}</code>{pending_note}",
+        f"Mã nạp: <code>{html.escape(memo)}</code>{pending_note}\n\n"
+        f"{support_line()}",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="📦 Mua tài khoản ngay", callback_data="products")]]
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📦 Mua ngay", callback_data="products"),
+                    InlineKeyboardButton(text="💰 Số dư", callback_data="balance"),
+                ],
+                [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+            ]
         ),
     )
     await notify_admin(
@@ -835,19 +1440,28 @@ async def watch_deposit(telegram_id: int, memo: str, expires_at: int) -> None:
 
 @dp.message(Command("deposit"))
 @dp.message(F.text == "💳 Nạp tiền")
-async def deposit_handler(message: Message, state: FSMContext) -> None:
+async def deposit_handler(message: Message, state: FSMContext, telegram_id: int | None = None) -> None:
+    user_id = telegram_id or message.from_user.id
+    if telegram_id is None:
+        remember_user(message.from_user)
+    else:
+        touch_user(user_id)
     await state.clear()
     await state.set_state(DepositStates.amount)
     await message.answer(
-        f"💳 <b>NẠP TIỀN TỰ ĐỘNG</b>\n\nNhập số tiền muốn nạp, tối thiểu <b>{money(MIN_DEPOSIT)}</b>.\n"
+        "💳 <b>NẠP TIỀN TỰ ĐỘNG</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"Nhập số tiền muốn nạp, tối thiểu <b>{money(MIN_DEPOSIT)}</b>.\n"
         "Ví dụ: <code>50000</code>\n\n"
+        "Sau đó quét QR và giữ nguyên nội dung chuyển khoản để hệ thống nhận diện nhanh.\n\n"
         f"{support_line()}",
-        reply_markup=main_keyboard(message.from_user.id),
+        reply_markup=main_keyboard(user_id),
     )
 
 
 @dp.message(DepositStates.amount)
 async def deposit_amount_handler(message: Message, state: FSMContext) -> None:
+    remember_user(message.from_user)
     amount = parse_amount(str(message.text or ""))
     if amount < MIN_DEPOSIT:
         await message.answer(f"Số tiền tối thiểu là {money(MIN_DEPOSIT)}. Vui lòng nhập lại.")
@@ -859,13 +1473,15 @@ async def deposit_amount_handler(message: Message, state: FSMContext) -> None:
         expires_at = int(data.get("expiresAt") or 0)
         bank = data.get("bank") if isinstance(data.get("bank"), dict) else {}
         caption = (
-            "💳 <b>QUÉT QR ĐỂ NẠP TIỀN</b>\n\n"
+            "💳 <b>QUÉT QR ĐỂ NẠP TIỀN</b>\n"
+            f"{UI_DIVIDER}\n\n"
             f"Số tiền: <b>{money(data.get('amount') or amount)}</b>\n"
             f"Ngân hàng: <b>MB Bank</b>\n"
             f"Số tài khoản: <code>{html.escape(str(bank.get('account') or ''))}</code>\n"
             f"Chủ tài khoản: <b>{html.escape(str(bank.get('accountName') or ''))}</b>\n"
             f"Nội dung chuyển khoản: <code>{html.escape(memo)}</code>\n\n"
-            "Giữ nguyên số tiền và nội dung chuyển khoản. Hệ thống sẽ tự động cộng tiền sau khi nhận được thanh toán."
+            "Giữ nguyên số tiền và nội dung chuyển khoản. Hệ thống sẽ tự động cộng tiền sau khi nhận được thanh toán.\n\n"
+            f"{support_line()}"
         )
         qr_url = str(data.get("qrUrl") or "")
         if qr_url:
@@ -934,8 +1550,7 @@ async def catalog_page_callback(callback: CallbackQuery) -> None:
     total_pages = max(1, (len(menu.products) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     await callback.message.edit_text(
-        f"📦 <b>DANH SÁCH SẢN PHẨM</b> · {len(menu.products)} sản phẩm\n"
-        f"Trang {page + 1}/{total_pages}\n\nChọn sản phẩm để xem chi tiết và mua tự động.",
+        catalog_text(menu, page),
         reply_markup=catalog_keyboard(menu, page),
     )
     await callback.answer()
@@ -996,6 +1611,7 @@ async def quantity_callback(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(QuantityStates.quantity)
 async def quantity_message_handler(message: Message, state: FSMContext) -> None:
+    remember_user(message.from_user)
     try:
         quantity = int(str(message.text or "").strip())
     except ValueError:
@@ -1021,7 +1637,8 @@ async def quantity_message_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
     total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
     await message.answer(
-        "🛒 <b>XÁC NHẬN ĐƠN HÀNG</b>\n\n"
+        "🛒 <b>XÁC NHẬN ĐƠN HÀNG</b>\n"
+        f"{UI_DIVIDER}\n\n"
         f"Sản phẩm: <b>{html.escape(str(product.get('name') or 'Sản phẩm'))}</b>\n"
         f"Số lượng: <b>{quantity}</b>\n"
         f"Tạm tính: <b>{money(total)}</b>\n\n"
@@ -1029,6 +1646,10 @@ async def quantity_message_handler(message: Message, state: FSMContext) -> None:
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✅ Xác nhận mua", callback_data=f"confirm|{menu.key}|{index}|{quantity}")],
+                [
+                    InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
+                    InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+                ],
                 [InlineKeyboardButton(text="‹ Quay lại", callback_data=f"product|{menu.key}|{index}")],
             ]
         ),
@@ -1081,14 +1702,18 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
                 )
                 purchase_attempts.pop(attempt_key, None)
                 await callback.message.edit_text(
-                    "💳 <b>SỐ DƯ CHƯA ĐỦ</b>\n\n"
+                    "💳 <b>SỐ DƯ CHƯA ĐỦ</b>\n"
+                    f"{UI_DIVIDER}\n\n"
                     f"Cần khoảng: <b>{money(expected_total)}</b>\n"
                     f"Đang có: <b>{money(balance)}</b>\n"
                     f"Cần nạp thêm: <b>{money(expected_total - balance)}</b>",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
                             [InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit")],
-                            [InlineKeyboardButton(text="📦 Quay lại sản phẩm", callback_data="products")],
+                            [
+                                InlineKeyboardButton(text="📦 Sản phẩm", callback_data="products"),
+                                InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+                            ],
                         ]
                     ),
                 )
@@ -1106,6 +1731,12 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
                 initial_message=callback.message,
             )
         except ApiError as exc:
+            LOGGER.warning(
+                "Checkout failed for order %s (%s): %s",
+                order_id,
+                exc.code,
+                exc.message,
+            )
             if exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
                 await notify_admin(
                     "⚠️ <b>ĐƠN HÀNG CẦN KIỂM TRA</b>\n\n"
@@ -1135,28 +1766,40 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
 async def products_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     if callback.message:
-        await show_catalog(callback.message, edit=True)
+        await show_catalog(callback.message, edit=True, telegram_id=callback.from_user.id)
+
+
+@dp.callback_query(F.data == "home")
+async def home_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await show_home(
+            callback.message,
+            edit=True,
+            telegram_id=callback.from_user.id,
+            display_name=callback.from_user.full_name,
+        )
 
 
 @dp.callback_query(F.data == "balance")
 async def balance_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     if callback.message:
-        await balance_handler(callback.message)
+        await balance_handler(callback.message, callback.from_user.id)
 
 
 @dp.callback_query(F.data == "orders")
 async def orders_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     if callback.message:
-        await orders_handler(callback.message)
+        await orders_handler(callback.message, callback.from_user.id)
 
 
 @dp.callback_query(F.data == "deposit")
 async def deposit_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     if callback.message:
-        await deposit_handler(callback.message, state)
+        await deposit_handler(callback.message, state, callback.from_user.id)
 
 
 # ---------------------------------------------------------------------------
@@ -1323,11 +1966,16 @@ async def main() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Mở menu chính"),
+            BotCommand(command="home", description="Về trang chủ"),
             BotCommand(command="products", description="Xem tài khoản đang bán"),
             BotCommand(command="deposit", description="Nạp tiền tự động"),
             BotCommand(command="balance", description="Xem số dư"),
             BotCommand(command="orders", description="Xem đơn hàng"),
+            BotCommand(command="help", description="Hướng dẫn mua hàng"),
+            BotCommand(command="support", description="Liên hệ hỗ trợ"),
             BotCommand(command="admin", description="Quản trị shop"),
+            BotCommand(command="users", description="Danh sách khách hàng"),
+            BotCommand(command="broadcast", description="Gửi thông báo cho khách"),
         ]
     )
     LOGGER.info("Starting Telegram account shop bot")
