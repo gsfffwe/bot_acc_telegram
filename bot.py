@@ -78,7 +78,7 @@ SEPAY_FORWARD_URL = os.getenv("SEPAY_FORWARD_URL", "").strip().rstrip("/")
 
 CATALOG_PAGE_SIZE = max(1, min(20, int(os.getenv("CATALOG_PAGE_SIZE", "8"))))
 MAX_QUANTITY = max(1, min(100, int(os.getenv("MAX_QUANTITY", "100"))))
-MIN_DEPOSIT = max(1, int(os.getenv("MIN_DEPOSIT", "10000")))
+MIN_DEPOSIT = max(0, int(os.getenv("MIN_DEPOSIT", "0")))
 DEPOSIT_WATCH_SECONDS = max(60, int(os.getenv("DEPOSIT_WATCH_SECONDS", "900")))
 DEPOSIT_POLL_SECONDS = max(3, int(os.getenv("DEPOSIT_POLL_SECONDS", "5")))
 SUPPORT_HANDLE = os.getenv("SUPPORT_TELEGRAM", "@tai_khoan_xin").strip() or "@tai_khoan_xin"
@@ -334,6 +334,12 @@ def money(value: Any) -> str:
     return f"{amount:,}".replace(",", ".") + "đ"
 
 
+def deposit_requirement_text() -> str:
+    if MIN_DEPOSIT <= 0:
+        return "không giới hạn tối thiểu, số tiền phải lớn hơn 0"
+    return f"tối thiểu <b>{money(MIN_DEPOSIT)}</b>"
+
+
 def new_order_id() -> str:
     """Tạo mã đơn ngắn, không làm lộ Telegram ID của khách."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -563,7 +569,7 @@ def product_detail_keyboard(menu: CatalogMenu, index: int, product: dict[str, An
     if stock > 0:
         rows.append(
             [
-                InlineKeyboardButton(text="🛒 Mua ngay", callback_data=f"confirm|{menu.key}|{index}|1"),
+                InlineKeyboardButton(text="🛒 Mua ngay", callback_data=f"payment|{menu.key}|{index}|1"),
                 InlineKeyboardButton(text="🔢 Số lượng", callback_data=f"quantity|{menu.key}|{index}"),
             ]
         )
@@ -577,6 +583,16 @@ def product_detail_keyboard(menu: CatalogMenu, index: int, product: dict[str, An
     )
     rows.append([InlineKeyboardButton(text="‹ Quay lại danh sách", callback_data=f"catalog|{menu.key}|{index // CATALOG_PAGE_SIZE}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def payment_method_keyboard(menu: CatalogMenu, index: int, quantity: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Thanh toán bằng số dư", callback_data=f"pay_balance|{menu.key}|{index}|{quantity}")],
+            [InlineKeyboardButton(text="📲 Thanh toán QR nhanh", callback_data=f"pay_qr|{menu.key}|{index}|{quantity}")],
+            [InlineKeyboardButton(text="‹ Quay lại sản phẩm", callback_data=f"product|{menu.key}|{index}")],
+        ]
+    )
 
 
 async def answer_in_chunks(message: Message, text: str, reply_markup: Any = None) -> None:
@@ -1381,6 +1397,84 @@ def deposit_keyboard(memo: str) -> InlineKeyboardMarkup:
     )
 
 
+def purchase_qr_keyboard(memo: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Tôi đã chuyển khoản", callback_data=f"deposit_check|{memo}")],
+            [InlineKeyboardButton(text="🧾 Xem đơn hàng", callback_data="orders")],
+            [InlineKeyboardButton(text="🆘 Hỗ trợ", url=support_url())],
+        ]
+    )
+
+
+async def create_and_send_deposit_qr(
+    message: Message,
+    telegram_id: int,
+    amount: int,
+    *,
+    pending: PendingPurchase | None = None,
+) -> dict[str, Any]:
+    data = await api.create_deposit(telegram_id, amount)
+    memo = str(data.get("memo") or "")
+    expires_at = int(data.get("expiresAt") or 0)
+    bank = data.get("bank") if isinstance(data.get("bank"), dict) else {}
+    is_purchase = pending is not None
+    if pending:
+        pending_purchases[telegram_id] = pending
+        caption = (
+            "📲 <b>THANH TOÁN ĐƠN HÀNG BẰNG QR</b>\n"
+            f"{UI_DIVIDER}\n\n"
+            f"Mã đơn: <code>{html.escape(pending.order_id)}</code>\n"
+            f"Sản phẩm: <b>{html.escape(pending.product_name)}</b>\n"
+            f"Số lượng: <b>{pending.quantity}</b>\n"
+            f"Số tiền cần chuyển: <b>{money(data.get('amount') or amount)}</b>\n\n"
+        )
+    else:
+        caption = (
+            "💳 <b>QUÉT QR ĐỂ NẠP TIỀN</b>\n"
+            f"{UI_DIVIDER}\n\n"
+            f"Số tiền: <b>{money(data.get('amount') or amount)}</b>\n"
+        )
+    caption += (
+        f"Ngân hàng: <b>MB Bank</b>\n"
+        f"Số tài khoản: <code>{html.escape(str(bank.get('account') or ''))}</code>\n"
+        f"Chủ tài khoản: <b>{html.escape(str(bank.get('accountName') or ''))}</b>\n"
+        f"Nội dung chuyển khoản: <code>{html.escape(memo)}</code>\n\n"
+        "Giữ nguyên số tiền và nội dung chuyển khoản. Hệ thống sẽ tự động xác nhận sau khi nhận được tiền.\n\n"
+        f"{support_line()}"
+    )
+    markup = purchase_qr_keyboard(memo) if is_purchase else deposit_keyboard(memo)
+    qr_url = str(data.get("qrUrl") or "")
+    if qr_url:
+        await message.answer_photo(photo=URLInputFile(qr_url), caption=caption, reply_markup=markup)
+    else:
+        await message.answer(caption, reply_markup=markup)
+
+    if is_purchase:
+        await notify_admin(
+            "📲 <b>CÓ YÊU CẦU THANH TOÁN ĐƠN HÀNG QUA QR</b>\n\n"
+            f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+            f"🧾 Mã đơn: <code>{html.escape(pending.order_id)}</code>\n"
+            f"📦 Sản phẩm: <b>{html.escape(pending.product_name)}</b>\n"
+            f"💰 Số tiền: <b>{money(data.get('amount') or amount)}</b>\n"
+            f"📝 Mã nạp: <code>{html.escape(memo)}</code>"
+        )
+    else:
+        await notify_admin(
+            "📥 <b>CÓ YÊU CẦU NẠP TIỀN MỚI</b>\n\n"
+            f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+            f"💰 Số tiền: <b>{money(data.get('amount') or amount)}</b>\n"
+            f"📝 Mã nạp: <code>{html.escape(memo)}</code>"
+        )
+
+    key = (telegram_id, memo)
+    old_task = deposit_watch_tasks.pop(key, None)
+    if old_task:
+        old_task.cancel()
+    deposit_watch_tasks[key] = asyncio.create_task(watch_deposit(telegram_id, memo, expires_at))
+    return data
+
+
 async def notify_deposit_paid(telegram_id: int, data: dict[str, Any]) -> None:
     global bot
     if not bot:
@@ -1451,7 +1545,7 @@ async def deposit_handler(message: Message, state: FSMContext, telegram_id: int 
     await message.answer(
         "💳 <b>NẠP TIỀN TỰ ĐỘNG</b>\n"
         f"{UI_DIVIDER}\n"
-        f"Nhập số tiền muốn nạp, tối thiểu <b>{money(MIN_DEPOSIT)}</b>.\n"
+        f"Nhập số tiền muốn nạp, {deposit_requirement_text()}.\n"
         "Ví dụ: <code>50000</code>\n\n"
         "Sau đó quét QR và giữ nguyên nội dung chuyển khoản để hệ thống nhận diện nhanh.\n\n"
         f"{support_line()}",
@@ -1463,48 +1557,15 @@ async def deposit_handler(message: Message, state: FSMContext, telegram_id: int 
 async def deposit_amount_handler(message: Message, state: FSMContext) -> None:
     remember_user(message.from_user)
     amount = parse_amount(str(message.text or ""))
-    if amount < MIN_DEPOSIT:
+    if amount <= 0:
+        await message.answer("Số tiền phải lớn hơn 0. Vui lòng nhập lại.")
+        return
+    if MIN_DEPOSIT > 0 and amount < MIN_DEPOSIT:
         await message.answer(f"Số tiền tối thiểu là {money(MIN_DEPOSIT)}. Vui lòng nhập lại.")
         return
     try:
-        data = await api.create_deposit(message.from_user.id, amount)
         await state.clear()
-        memo = str(data.get("memo") or "")
-        expires_at = int(data.get("expiresAt") or 0)
-        bank = data.get("bank") if isinstance(data.get("bank"), dict) else {}
-        caption = (
-            "💳 <b>QUÉT QR ĐỂ NẠP TIỀN</b>\n"
-            f"{UI_DIVIDER}\n\n"
-            f"Số tiền: <b>{money(data.get('amount') or amount)}</b>\n"
-            f"Ngân hàng: <b>MB Bank</b>\n"
-            f"Số tài khoản: <code>{html.escape(str(bank.get('account') or ''))}</code>\n"
-            f"Chủ tài khoản: <b>{html.escape(str(bank.get('accountName') or ''))}</b>\n"
-            f"Nội dung chuyển khoản: <code>{html.escape(memo)}</code>\n\n"
-            "Giữ nguyên số tiền và nội dung chuyển khoản. Hệ thống sẽ tự động cộng tiền sau khi nhận được thanh toán.\n\n"
-            f"{support_line()}"
-        )
-        qr_url = str(data.get("qrUrl") or "")
-        if qr_url:
-            await message.answer_photo(
-                photo=URLInputFile(qr_url),
-                caption=caption,
-                reply_markup=deposit_keyboard(memo),
-            )
-        else:
-            await message.answer(caption, reply_markup=deposit_keyboard(memo))
-        await notify_admin(
-            "📥 <b>CÓ YÊU CẦU NẠP TIỀN MỚI</b>\n\n"
-            f"👤 Telegram ID: <code>{message.from_user.id}</code>\n"
-            f"💰 Số tiền: <b>{money(data.get('amount') or amount)}</b>\n"
-            f"📝 Mã nạp: <code>{html.escape(memo)}</code>"
-        )
-        key = (message.from_user.id, memo)
-        old_task = deposit_watch_tasks.pop(key, None)
-        if old_task:
-            old_task.cancel()
-        deposit_watch_tasks[key] = asyncio.create_task(
-            watch_deposit(message.from_user.id, memo, expires_at)
-        )
+        await create_and_send_deposit_qr(message, message.from_user.id, amount)
     except ApiError as exc:
         await state.clear()
         await handle_api_error(message, exc)
@@ -1645,18 +1706,52 @@ async def quantity_message_handler(message: Message, state: FSMContext) -> None:
         "Giá cuối cùng và tồn kho sẽ được website kiểm tra lại khi thanh toán.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Xác nhận mua", callback_data=f"confirm|{menu.key}|{index}|{quantity}")],
-                [
-                    InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
-                    InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
-                ],
+                [InlineKeyboardButton(text="✅ Chọn phương thức thanh toán", callback_data=f"payment|{menu.key}|{index}|{quantity}")],
                 [InlineKeyboardButton(text="‹ Quay lại", callback_data=f"product|{menu.key}|{index}")],
             ]
         ),
     )
 
 
+@dp.callback_query(F.data.startswith("payment|"))
+async def payment_method_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 4:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = menu_for_user(callback.from_user.id)
+    if not menu or menu.key != parts[1]:
+        await callback.answer("Danh sách đã cũ, vui lòng mở lại sản phẩm.", show_alert=True)
+        return
+    try:
+        index = int(parts[2])
+        quantity = int(parts[3])
+        product = menu.products[index]
+    except (ValueError, IndexError):
+        await callback.answer("Sản phẩm hoặc số lượng không hợp lệ.", show_alert=True)
+        return
+    stock = int(product.get("quantity") or 0)
+    if quantity < 1 or quantity > MAX_QUANTITY or quantity > stock:
+        await callback.answer("Số lượng hiện không còn đủ.", show_alert=True)
+        return
+    total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+    await callback.message.edit_text(
+        "💳 <b>CHỌN PHƯƠNG THỨC THANH TOÁN</b>\n"
+        f"{UI_DIVIDER}\n\n"
+        f"📦 Sản phẩm: <b>{html.escape(str(product.get('name') or 'Sản phẩm'))}</b>\n"
+        f"🔢 Số lượng: <b>{quantity}</b>\n"
+        f"💵 Tổng tiền: <b>{money(total)}</b>\n\n"
+        "Bạn có thể dùng số dư sẵn có hoặc chuyển khoản QR đúng số tiền trên đơn.",
+        reply_markup=payment_method_keyboard(menu, index, quantity),
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("confirm|"))
+@dp.callback_query(F.data.startswith("pay_balance|"))
 async def confirm_purchase_callback(callback: CallbackQuery) -> None:
     if not callback.message:
         await callback.answer()
@@ -1706,10 +1801,12 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
                     f"{UI_DIVIDER}\n\n"
                     f"Cần khoảng: <b>{money(expected_total)}</b>\n"
                     f"Đang có: <b>{money(balance)}</b>\n"
-                    f"Cần nạp thêm: <b>{money(expected_total - balance)}</b>",
+                    f"Cần nạp thêm: <b>{money(expected_total - balance)}</b>\n\n"
+                    "Chọn QR nhanh để chuyển đúng số tiền của đơn hàng, hoặc nạp một số tiền khác.",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
-                            [InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit")],
+                            [InlineKeyboardButton(text="📲 QR đúng số tiền đơn", callback_data=f"pay_qr|{menu.key}|{index}|{quantity}")],
+                            [InlineKeyboardButton(text="💳 Nạp số tiền khác", callback_data="deposit")],
                             [
                                 InlineKeyboardButton(text="📦 Sản phẩm", callback_data="products"),
                                 InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
@@ -1760,6 +1857,71 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
                 "❌ Có lỗi ngoài dự kiến khi xử lý đơn. Vui lòng kiểm tra mục Đơn hàng trước khi thử lại.",
                 reply_markup=after_purchase_keyboard(),
             )
+
+
+@dp.callback_query(F.data.startswith("pay_qr|"))
+async def quick_qr_payment_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 4:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = menu_for_user(callback.from_user.id)
+    if not menu or menu.key != parts[1]:
+        await callback.answer("Danh sách đã cũ, vui lòng mở lại sản phẩm.", show_alert=True)
+        return
+    try:
+        index = int(parts[2])
+        quantity = int(parts[3])
+        product = menu.products[index]
+    except (ValueError, IndexError):
+        await callback.answer("Sản phẩm hoặc số lượng không hợp lệ.", show_alert=True)
+        return
+
+    stock = int(product.get("quantity") or 0)
+    if quantity < 1 or quantity > MAX_QUANTITY or quantity > stock:
+        await callback.answer("Số lượng hiện không còn đủ.", show_alert=True)
+        return
+    expected_total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+    attempt_key = (callback.from_user.id, menu.key, index, quantity)
+    existing = pending_purchases.get(callback.from_user.id)
+    if existing and (
+        existing.product_id != str(product.get("id") or "")
+        or existing.quantity != quantity
+    ):
+        await callback.answer("Bạn đang có một đơn khác chờ thanh toán.", show_alert=True)
+        return
+    if any(user_id == callback.from_user.id for user_id, _memo in deposit_watch_tasks):
+        await callback.answer("Bạn đang có một mã QR chờ thanh toán. Hãy dùng mã QR trước đó.", show_alert=True)
+        return
+
+    order_id = existing.order_id if existing else purchase_attempts.setdefault(attempt_key, new_order_id())
+    pending = existing or PendingPurchase(
+        product_id=str(product.get("id") or ""),
+        product_name=str(product.get("name") or "Sản phẩm"),
+        quantity=quantity,
+        order_id=order_id,
+        expected_total=expected_total,
+    )
+    await callback.answer("Đang tạo QR thanh toán…")
+    try:
+        await callback.message.edit_text(
+            "⏳ <b>ĐANG TẠO QR THANH TOÁN</b>\n\n"
+            f"Số tiền đơn hàng: <b>{money(expected_total)}</b>"
+        )
+        await create_and_send_deposit_qr(
+            callback.message,
+            callback.from_user.id,
+            expected_total,
+            pending=pending,
+        )
+    except ApiError as exc:
+        await callback.message.edit_text(
+            f"❌ {html.escape(public_error_message(exc))}",
+            reply_markup=after_purchase_keyboard(),
+        )
 
 
 @dp.callback_query(F.data == "products")
