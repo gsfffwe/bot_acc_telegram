@@ -81,6 +81,7 @@ MAX_QUANTITY = max(1, min(100, int(os.getenv("MAX_QUANTITY", "100"))))
 MIN_DEPOSIT = max(1, int(os.getenv("MIN_DEPOSIT", "10000")))
 DEPOSIT_WATCH_SECONDS = max(60, int(os.getenv("DEPOSIT_WATCH_SECONDS", "900")))
 DEPOSIT_POLL_SECONDS = max(3, int(os.getenv("DEPOSIT_POLL_SECONDS", "5")))
+SUPPORT_HANDLE = os.getenv("SUPPORT_TELEGRAM", "@tai_khoan_xin").strip() or "@tai_khoan_xin"
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
 
 logging.basicConfig(
@@ -292,6 +293,20 @@ def money(value: Any) -> str:
     return f"{amount:,}".replace(",", ".") + "đ"
 
 
+def new_order_id() -> str:
+    """Tạo mã đơn ngắn, không làm lộ Telegram ID của khách."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "DH-" + "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def support_line() -> str:
+    return f"🆘 Hỗ trợ: <code>{html.escape(SUPPORT_HANDLE)}</code>"
+
+
+def support_url() -> str:
+    return f"https://t.me/{SUPPORT_HANDLE.lstrip('@')}"
+
+
 def short_text(value: Any, length: int = 30) -> str:
     text = " ".join(str(value or "").split())
     return text if len(text) <= length else text[: max(1, length - 1)] + "…"
@@ -341,6 +356,7 @@ def after_purchase_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📦 Mua sản phẩm khác", callback_data="products")],
             [InlineKeyboardButton(text="💰 Xem số dư", callback_data="balance")],
             [InlineKeyboardButton(text="🧾 Xem đơn hàng", callback_data="orders")],
+            [InlineKeyboardButton(text="🆘 Hỗ trợ", url=support_url())],
         ]
     )
 
@@ -508,7 +524,8 @@ async def send_purchase_result(
             "🧾 <b>ĐƠN ĐÃ GHI NHẬN</b>\n\n"
             f"Mã đơn: <code>{html.escape(order_id)}</code>\n"
             f"Trạng thái: <b>{html.escape(status)}</b>\n\n"
-            "Website chưa trả thông tin tài khoản ngay lúc này. Vui lòng xem lại trong mục Đơn hàng."
+            "Hệ thống chưa trả thông tin tài khoản ngay lúc này. Vui lòng xem lại trong mục Đơn hàng.\n\n"
+            f"{support_line()}"
         )
         if initial_message:
             await initial_message.edit_text(text, reply_markup=after_purchase_keyboard())
@@ -528,7 +545,8 @@ async def send_purchase_result(
         f"📦 Sản phẩm: <b>{html.escape(str(detail.get('productName') or fallback_product_name or 'Sản phẩm'))}</b>\n"
         f"🔢 Số lượng: <b>{int(detail.get('deliveredQuantity') or len(accounts))}</b>\n"
         f"💵 Thanh toán: <b>{money(detail.get('price') or result.get('totalAmount') or expected_total)}</b>\n\n"
-        "🔐 <b>THÔNG TIN TÀI KHOẢN</b>"
+        "🔐 <b>THÔNG TIN TÀI KHOẢN</b>\n"
+        f"{support_line()}"
     )
     if initial_message:
         await initial_message.edit_text(summary, reply_markup=after_purchase_keyboard())
@@ -647,7 +665,8 @@ async def start_handler(message: Message, state: FSMContext) -> None:
         "🛍 <b>SHOP TÀI KHOẢN</b>\n\n"
         "Chọn sản phẩm bạn cần, nạp tiền nhanh bằng QR và nhận thông tin ngay sau khi thanh toán thành công.\n\n"
         "✅ Giao tự động\n"
-        "🔒 Thông tin đơn hàng được bảo mật.",
+        "🔒 Thông tin đơn hàng được bảo mật.\n\n"
+        f"{support_line()}",
         reply_markup=main_keyboard(message.from_user.id),
     )
 
@@ -661,7 +680,8 @@ async def help_handler(message: Message) -> None:
         "2. Bấm sản phẩm cần mua.\n"
         "3. Nếu chưa đủ số dư, chọn 💳 Nạp tiền và chuyển khoản đúng nội dung.\n"
         "4. Hệ thống tự động xác nhận; sau đó bot xử lý và gửi thông tin cho bạn.\n\n"
-        "Lệnh: /products, /deposit, /balance, /orders",
+        "Lệnh: /products, /deposit, /balance, /orders\n\n"
+        f"{support_line()}",
         reply_markup=main_keyboard(message.from_user.id),
     )
 
@@ -759,6 +779,7 @@ def deposit_keyboard(memo: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Tôi đã chuyển khoản", callback_data=f"deposit_check|{memo}")],
             [InlineKeyboardButton(text="💰 Kiểm tra số dư", callback_data="balance")],
+            [InlineKeyboardButton(text="🆘 Hỗ trợ", url=support_url())],
         ]
     )
 
@@ -819,7 +840,8 @@ async def deposit_handler(message: Message, state: FSMContext) -> None:
     await state.set_state(DepositStates.amount)
     await message.answer(
         f"💳 <b>NẠP TIỀN TỰ ĐỘNG</b>\n\nNhập số tiền muốn nạp, tối thiểu <b>{money(MIN_DEPOSIT)}</b>.\n"
-        "Ví dụ: <code>50000</code>",
+        "Ví dụ: <code>50000</code>\n\n"
+        f"{support_line()}",
         reply_markup=main_keyboard(message.from_user.id),
     )
 
@@ -1040,7 +1062,7 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
     attempt_key = (callback.from_user.id, menu.key, index, quantity)
     order_id = purchase_attempts.setdefault(
         attempt_key,
-        f"tg_{callback.from_user.id}_{secrets.token_hex(10)}",
+        new_order_id(),
     )
     await callback.answer("Đang kiểm tra số dư và tồn kho…")
     async with purchase_locks[callback.from_user.id]:

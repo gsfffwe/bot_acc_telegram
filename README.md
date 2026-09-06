@@ -59,6 +59,17 @@ Admin dùng đúng số Telegram ID (không phải username) trong `ADMIN_TELEGR
 
 Mỗi đơn hoàn tất được gửi cho khách và bot đồng thời gửi đầy đủ thông tin đơn cùng tài khoản đã cấp cho admin.
 
+Bot hiển thị thông tin hỗ trợ tại `@tai_khoan_xin` (có thể đổi bằng biến `SUPPORT_TELEGRAM`).
+
+## Giá riêng cho Telegram
+
+Trong trang quản trị website, mỗi sản phẩm có thêm trường **Giá riêng trên Telegram (VNĐ)**.
+Bỏ trống trường này để bot dùng giá web. Khi có giá riêng, bot Telegram dùng giá đó cả lúc hiển thị và lúc trừ số dư; giá web và tồn kho vẫn giữ độc lập.
+
+## Mã đơn hàng
+
+Đơn mua từ bot dùng mã ngắn dạng `DH-XXXXXXXX`, không chứa Telegram ID của khách.
+
 ## Deploy worker
 
 Bot chạy polling nên cần deploy như một worker/service bằng `Procfile`. Vì bot có thêm endpoint `/sepay/webhook`, nền tảng deploy cần cấp HTTPS public URL. Cấu hình webhook SePay tới:
