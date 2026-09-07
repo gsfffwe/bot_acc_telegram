@@ -677,7 +677,11 @@ def catalog_keyboard(menu: CatalogMenu, page: int) -> InlineKeyboardMarkup:
     for index, product in enumerate(menu.products[start : start + CATALOG_PAGE_SIZE], start=start):
         stock = int(product.get("quantity") or 0)
         stock_text = f"🟢 {stock}" if stock > 0 else "🔴 hết"
-        label = f"{product_badge(product)} {short_text(product.get('name'), 18)} · {money(product.get('finalPrice', product.get('price')))} · {stock_text}"
+        duration = short_text(product.get("duration") or "Dùng ngay", 14)
+        label = (
+            f"{product_badge(product)} {short_text(product.get('name'), 15)} · "
+            f"⏳ {duration} · {money(product.get('finalPrice', product.get('price')))} · {stock_text}"
+        )
         rows.append([InlineKeyboardButton(text=label, callback_data=f"product|{menu.key}|{index}")])
 
     nav: list[InlineKeyboardButton] = []
