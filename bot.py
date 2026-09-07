@@ -20,9 +20,11 @@ import sqlite3
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import uvicorn
@@ -40,6 +42,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    FSInputFile,
     URLInputFile,
 )
 from dotenv import load_dotenv
@@ -72,6 +75,11 @@ ADMIN_TELEGRAM_IDS = parse_admin_ids()
 ADMIN_TELEGRAM_ID = min(ADMIN_TELEGRAM_IDS) if ADMIN_TELEGRAM_IDS else 0
 DATA_DIR = Path(os.getenv("BOT_DATA_DIR", str(BASE_DIR)))
 DB_PATH = DATA_DIR / "telegram_shop.sqlite3"
+BACKUP_DIR = Path(os.getenv("BOT_BACKUP_DIR", "").strip() or str(DATA_DIR / "backups"))
+BACKUP_KEEP = max(1, int(os.getenv("BOT_BACKUP_KEEP", "14")))
+BACKUP_INTERVAL_SECONDS = max(300, int(os.getenv("BOT_BACKUP_INTERVAL_SECONDS", "21600")))
+BACKUP_DAILY_TIME = os.getenv("BOT_BACKUP_DAILY_TIME", "23:00").strip() or "23:00"
+BACKUP_TIMEZONE = os.getenv("BOT_BACKUP_TIMEZONE", "Asia/Ho_Chi_Minh").strip() or "Asia/Ho_Chi_Minh"
 PORT = int(os.getenv("PORT", "8000"))
 WEBHOOK_TOKEN = os.getenv("SEPAY_WEBHOOK_TOKEN", "").strip()
 SEPAY_FORWARD_URL = os.getenv("SEPAY_FORWARD_URL", "").strip().rstrip("/")
@@ -102,6 +110,7 @@ class QuantityStates(StatesGroup):
 class AdminStates(StatesGroup):
     broadcast = State()
     confirm_broadcast = State()
+    product_badge = State()
 
 
 class ApiError(RuntimeError):
@@ -252,6 +261,7 @@ purchase_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 deposit_watch_tasks: dict[tuple[int, str], asyncio.Task[Any]] = {}
 deposit_notified: set[tuple[int, str]] = set()
 admin_notified_orders: set[str] = set()
+badge_menus: dict[int, CatalogMenu] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +286,15 @@ def init_db() -> None:
             conn.execute("ALTER TABLE telegram_users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
         if "username" not in columns:
             conn.execute("ALTER TABLE telegram_users ADD COLUMN username TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_badges(
+                product_id TEXT PRIMARY KEY,
+                badge TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
 
 
 def touch_user(telegram_id: int, display_name: str = "", username: str = "") -> None:
@@ -292,6 +311,107 @@ def touch_user(telegram_id: int, display_name: str = "", username: str = "") -> 
             """,
             (telegram_id, now, now, str(display_name or "").strip(), str(username or "").strip()),
         )
+
+
+def backup_database() -> Path | None:
+    """Sao lưu SQLite bằng cơ chế backup native, an toàn với WAL đang hoạt động."""
+    if not DB_PATH.exists():
+        return None
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target = BACKUP_DIR / f"telegram_shop_{timestamp}.db"
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as source, sqlite3.connect(target, timeout=30) as destination:
+            source.backup(destination, pages=100, sleep=0.1)
+        backups = sorted(
+            BACKUP_DIR.glob("telegram_shop_*.db"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for old_backup in backups[BACKUP_KEEP:]:
+            try:
+                old_backup.unlink()
+            except OSError:
+                LOGGER.warning("Could not remove old database backup %s", old_backup)
+        LOGGER.info("Database backup created: %s", target)
+        return target
+    except (OSError, sqlite3.Error):
+        LOGGER.exception("Could not create database backup")
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
+async def database_backup_loop() -> None:
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
+        await asyncio.to_thread(backup_database)
+
+
+def backup_timezone() -> Any:
+    try:
+        return ZoneInfo(BACKUP_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        if BACKUP_TIMEZONE.casefold() in {"asia/ho_chi_minh", "asia/saigon", "utc+7", "gmt+7"}:
+            return timezone(timedelta(hours=7), name="Asia/Ho_Chi_Minh")
+        LOGGER.warning("Unknown backup timezone %s; using server timezone.", BACKUP_TIMEZONE)
+        return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def seconds_until_daily_backup() -> float:
+    try:
+        hour_text, minute_text = BACKUP_DAILY_TIME.split(":", 1)
+        hour = max(0, min(23, int(hour_text)))
+        minute = max(0, min(59, int(minute_text)))
+    except (TypeError, ValueError):
+        hour, minute = 23, 0
+        LOGGER.warning("Invalid BOT_BACKUP_DAILY_TIME=%r; using 23:00.", BACKUP_DAILY_TIME)
+    now = datetime.now(backup_timezone())
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(1.0, (target - now).total_seconds())
+
+
+async def send_database_backup_to_admin(target_admin_id: int | None = None) -> int:
+    """Tạo bản sao mới và gửi file .db vào Telegram của admin."""
+    global bot
+    if not bot:
+        return 0
+    admin_ids = [target_admin_id] if target_admin_id else sorted(ADMIN_TELEGRAM_IDS)
+    admin_ids = [admin_id for admin_id in admin_ids if admin_id and is_admin(admin_id)]
+    if not admin_ids:
+        LOGGER.warning("No admin Telegram ID available for database backup delivery.")
+        return 0
+    backup_path = await asyncio.to_thread(backup_database)
+    if not backup_path:
+        return 0
+    caption = (
+        "💾 <b>BACKUP DỮ LIỆU BOT</b>\n\n"
+        f"📁 File: <code>{html.escape(backup_path.name)}</code>\n"
+        f"🕒 Thời gian: <b>{datetime.now(backup_timezone()).strftime('%d/%m/%Y %H:%M')}</b>\n"
+        "Hãy lưu file này ở nơi an toàn để khôi phục khi cần."
+    )
+    sent = 0
+    for admin_id in admin_ids:
+        try:
+            await bot.send_document(
+                admin_id,
+                document=FSInputFile(str(backup_path)),
+                caption=caption,
+            )
+            sent += 1
+        except Exception:
+            LOGGER.exception("Could not send database backup to admin %s", admin_id)
+    return sent
+
+
+async def daily_database_backup_loop() -> None:
+    while True:
+        await asyncio.sleep(seconds_until_daily_backup())
+        await send_database_backup_to_admin()
 
 
 def remember_user(user: Any) -> None:
@@ -318,6 +438,47 @@ def local_users() -> dict[int, dict[str, Any]]:
         }
         for row in rows
     }
+
+
+def product_key(product: dict[str, Any]) -> str:
+    return str(product.get("id") or product.get("productId") or product.get("name") or "").strip()
+
+
+def normalize_product_badge(value: str) -> str:
+    badge = " ".join(str(value or "").split()).strip()
+    return badge[:12]
+
+
+def product_badge(product: dict[str, Any]) -> str:
+    key = product_key(product)
+    if key:
+        try:
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                row = conn.execute("SELECT badge FROM product_badges WHERE product_id = ?", (key,)).fetchone()
+            if row and str(row[0] or "").strip():
+                return str(row[0]).strip()
+        except sqlite3.Error:
+            LOGGER.debug("Product badge table is not ready yet")
+    fallback = normalize_product_badge(str(product.get("badge") or product.get("icon") or product.get("emoji") or ""))
+    return fallback or "📦"
+
+
+def save_product_badge(product_id: str, badge: str | None) -> None:
+    key = str(product_id or "").strip()
+    if not key:
+        return
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        if badge:
+            conn.execute(
+                """
+                INSERT INTO product_badges(product_id, badge, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(product_id) DO UPDATE SET badge = excluded.badge, updated_at = excluded.updated_at
+                """,
+                (key, normalize_product_badge(badge), int(time.time())),
+            )
+        else:
+            conn.execute("DELETE FROM product_badges WHERE product_id = ?", (key,))
 
 
 # ---------------------------------------------------------------------------
@@ -516,8 +677,7 @@ def catalog_keyboard(menu: CatalogMenu, page: int) -> InlineKeyboardMarkup:
     for index, product in enumerate(menu.products[start : start + CATALOG_PAGE_SIZE], start=start):
         stock = int(product.get("quantity") or 0)
         stock_text = f"🟢 {stock}" if stock > 0 else "🔴 hết"
-        duration = short_text(product.get("duration") or "Dùng ngay", 14)
-        label = f"{short_text(product.get('name'), 20)} · {money(product.get('finalPrice', product.get('price')))} · {stock_text}"
+        label = f"{product_badge(product)} {short_text(product.get('name'), 18)} · {money(product.get('finalPrice', product.get('price')))} · {stock_text}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"product|{menu.key}|{index}")])
 
     nav: list[InlineKeyboardButton] = []
@@ -542,6 +702,7 @@ def product_text(product: dict[str, Any], discount_percent: int) -> str:
     duration = html.escape(str(product.get("duration") or "Dùng ngay"))
     fmt = html.escape(str(product.get("format") or "Theo mô tả sản phẩm"))
     warranty = html.escape(product_warranty(product))
+    badge = html.escape(product_badge(product))
     stock = int(product.get("quantity") or 0)
     price = money(product.get("finalPrice", product.get("price")))
     old_price = money(product.get("price"))
@@ -549,7 +710,7 @@ def product_text(product: dict[str, Any], discount_percent: int) -> str:
     if discount_percent > 0 and int(product.get("finalPrice") or 0) != int(product.get("price") or 0):
         price_line += f" <s>{old_price}</s> (-{discount_percent}%)"
     lines = [
-        f"📦 <b>{name}</b>",
+        f"{badge} <b>{name}</b>",
         UI_DIVIDER,
         "",
         price_line,
@@ -922,6 +1083,7 @@ async def show_catalog(message: Message, *, edit: bool = False, telegram_id: int
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
     await show_home(message)
+    await show_catalog(message)
 
 
 @dp.message(Command("home"))
@@ -1047,6 +1209,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📊 Làm mới thống kê", callback_data="admin_dashboard")],
             [InlineKeyboardButton(text="👥 Danh sách khách hàng", callback_data="admin_users")],
             [InlineKeyboardButton(text="📣 Gửi thông báo", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="🏷️ Gán nhãn sản phẩm", callback_data="admin_badges")],
+            [InlineKeyboardButton(text="💾 Gửi backup ngay", callback_data="admin_backup_now")],
             [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
         ]
     )
@@ -1061,6 +1225,45 @@ def admin_broadcast_keyboard() -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def admin_badges_keyboard(menu: CatalogMenu) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, product in enumerate(menu.products):
+        label = f"{product_badge(product)} {short_text(product.get('name'), 28)}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"admin_badge_select|{menu.key}|{index}")])
+    rows.append([InlineKeyboardButton(text="🛠 Quản trị", callback_data="admin_dashboard")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def render_admin_badges(message: Message, admin_id: int, *, edit: bool = False) -> None:
+    if not is_admin(admin_id):
+        if edit:
+            await message.answer("Bạn không có quyền sử dụng chức năng này.")
+        else:
+            await message.answer("Bạn không có quyền sử dụng chức năng này.", reply_markup=main_keyboard(admin_id))
+        return
+    data = await api.catalog(admin_id)
+    products = [item for item in data.get("products", []) if isinstance(item, dict)]
+    menu = CatalogMenu(
+        key=secrets.token_hex(3),
+        products=products,
+        discount_percent=int(data.get("discountPercent") or 0),
+        created_at=time.time(),
+    )
+    badge_menus[admin_id] = menu
+    text = (
+        "🏷️ <b>GÁN NHÃN SẢN PHẨM</b>\n"
+        f"{UI_DIVIDER}\n"
+        "Chọn sản phẩm rồi gửi emoji/icon muốn hiển thị trước tên.\n"
+        "Ví dụ: <code>🤖</code> cho ChatGPT Plus. Gửi <code>xóa</code> để dùng icon mặc định."
+    )
+    if not products:
+        text += "\n\nHiện chưa có sản phẩm để gán nhãn."
+    if edit:
+        await message.edit_text(text, reply_markup=admin_badges_keyboard(menu) if products else admin_keyboard())
+    else:
+        await message.answer(text, reply_markup=admin_badges_keyboard(menu) if products else admin_keyboard())
 
 
 async def begin_admin_broadcast(message: Message, state: FSMContext, admin_id: int) -> None:
@@ -1190,6 +1393,33 @@ async def admin_handler(message: Message) -> None:
         await handle_api_error(message, exc)
 
 
+@dp.message(Command("backup"))
+async def backup_command_handler(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("Bạn không có quyền tạo backup.", reply_markup=main_keyboard(message.from_user.id))
+        return
+    sent = await send_database_backup_to_admin(message.from_user.id)
+    if sent:
+        await message.answer("✅ Đã gửi file backup .db vào chat admin của bạn.")
+    else:
+        await message.answer("⚠️ Chưa gửi được file backup. Hãy kiểm tra log Railway.")
+
+
+@dp.callback_query(F.data == "admin_backup_now")
+async def admin_backup_now_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer("Đang tạo và gửi backup…")
+    sent = await send_database_backup_to_admin(callback.from_user.id)
+    if callback.message:
+        await callback.message.answer(
+            "✅ Đã gửi file backup .db vào chat admin của bạn."
+            if sent
+            else "⚠️ Chưa gửi được file backup. Hãy kiểm tra log Railway."
+        )
+
+
 @dp.callback_query(F.data == "admin_dashboard")
 async def admin_dashboard_callback(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
@@ -1223,6 +1453,100 @@ async def admin_users_callback(callback: CallbackQuery) -> None:
         await callback.answer()
     except ApiError as exc:
         await callback.answer(public_error_message(exc)[:180], show_alert=True)
+
+
+@dp.callback_query(F.data == "admin_badges")
+async def admin_badges_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    try:
+        if callback.message:
+            await render_admin_badges(callback.message, callback.from_user.id, edit=True)
+        await callback.answer()
+    except ApiError as exc:
+        await callback.answer(public_error_message(exc)[:180], show_alert=True)
+
+
+@dp.message(Command("badges"))
+async def badges_command_handler(message: Message) -> None:
+    try:
+        await render_admin_badges(message, message.from_user.id)
+    except ApiError as exc:
+        await handle_api_error(message, exc)
+
+
+@dp.callback_query(F.data.startswith("admin_badge_select|"))
+async def admin_badge_select_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 3:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = badge_menus.get(callback.from_user.id)
+    if not menu or menu.key != parts[1] or time.time() - menu.created_at > 30 * 60:
+        await callback.answer("Danh sách sản phẩm đã hết hạn, hãy mở lại.", show_alert=True)
+        return
+    try:
+        product = menu.products[int(parts[2])]
+    except (ValueError, IndexError):
+        await callback.answer("Sản phẩm không hợp lệ.", show_alert=True)
+        return
+    product_id = product_key(product)
+    if not product_id:
+        await callback.answer("Sản phẩm chưa có mã nhận diện.", show_alert=True)
+        return
+    await state.set_state(AdminStates.product_badge)
+    await state.update_data(product_id=product_id, product_name=str(product.get("name") or "Sản phẩm"))
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "🏷️ <b>GÁN NHÃN SẢN PHẨM</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"Sản phẩm: <b>{html.escape(str(product.get('name') or 'Sản phẩm'))}</b>\n\n"
+            "Gửi một emoji/icon, ví dụ <code>🤖</code>.\n"
+            "Bạn cũng có thể gửi sticker; bot sẽ lấy emoji đại diện của sticker.\n"
+            "Gửi <code>xóa</code> để bỏ nhãn tùy chỉnh."
+        )
+
+
+@dp.message(AdminStates.product_badge)
+async def admin_badge_message_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    product_id = str(data.get("product_id") or "")
+    product_name = str(data.get("product_name") or "Sản phẩm")
+    if not product_id:
+        await state.clear()
+        await message.answer("Phiên gán nhãn đã hết hạn.", reply_markup=admin_keyboard())
+        return
+
+    if message.sticker:
+        badge = normalize_product_badge(str(message.sticker.emoji or "🏷️"))
+    elif message.text:
+        raw = str(message.text).strip()
+        if raw.casefold() in {"xóa", "xoa", "remove", "none", "default"}:
+            badge = ""
+        else:
+            badge = normalize_product_badge(raw)
+    else:
+        await message.answer("Vui lòng gửi emoji, icon dạng chữ hoặc sticker.")
+        return
+
+    if message.text and not badge and str(message.text).strip().casefold() not in {"xóa", "xoa", "remove", "none", "default"}:
+        await message.answer("Nhãn không hợp lệ. Hãy gửi một emoji/icon ngắn.")
+        return
+    save_product_badge(product_id, badge or None)
+    await state.clear()
+    result = "đã bỏ về icon mặc định" if not badge else f"đã đặt thành {html.escape(badge)}"
+    await message.answer(
+        f"✅ Nhãn của <b>{html.escape(product_name)}</b> {result}.",
+        reply_markup=admin_keyboard(),
+    )
 
 
 @dp.message(Command("users"))
@@ -2124,29 +2448,41 @@ async def main() -> None:
     if not ADMIN_TELEGRAM_IDS:
         LOGGER.warning("No Telegram admin ID configured; /admin will be unavailable.")
     init_db()
+    backup_database()
+    backup_task = asyncio.create_task(database_backup_loop())
+    daily_backup_task = asyncio.create_task(daily_database_backup_loop())
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Mở menu chính"),
-            BotCommand(command="home", description="Về trang chủ"),
-            BotCommand(command="products", description="Xem tài khoản đang bán"),
-            BotCommand(command="deposit", description="Nạp tiền tự động"),
-            BotCommand(command="balance", description="Xem số dư"),
-            BotCommand(command="orders", description="Xem đơn hàng"),
-            BotCommand(command="help", description="Hướng dẫn mua hàng"),
-            BotCommand(command="support", description="Liên hệ hỗ trợ"),
-            BotCommand(command="admin", description="Quản trị shop"),
-            BotCommand(command="users", description="Danh sách khách hàng"),
-            BotCommand(command="broadcast", description="Gửi thông báo cho khách"),
-        ]
-    )
-    LOGGER.info("Starting Telegram account shop bot")
     try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Mở menu chính"),
+                BotCommand(command="home", description="Về trang chủ"),
+                BotCommand(command="products", description="Xem tài khoản đang bán"),
+                BotCommand(command="deposit", description="Nạp tiền tự động"),
+                BotCommand(command="balance", description="Xem số dư"),
+                BotCommand(command="orders", description="Xem đơn hàng"),
+                BotCommand(command="help", description="Hướng dẫn mua hàng"),
+                BotCommand(command="support", description="Liên hệ hỗ trợ"),
+                BotCommand(command="admin", description="Quản trị shop"),
+                BotCommand(command="users", description="Danh sách khách hàng"),
+                BotCommand(command="badges", description="Gán icon sản phẩm"),
+                BotCommand(command="broadcast", description="Gửi thông báo cho khách"),
+                BotCommand(command="backup", description="Gửi backup dữ liệu"),
+            ]
+        )
+        LOGGER.info("Starting Telegram account shop bot")
         await asyncio.gather(
             dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()),
             run_web(),
         )
     finally:
+        backup_task.cancel()
+        daily_backup_task.cancel()
+        try:
+            await asyncio.gather(backup_task, daily_backup_task)
+        except asyncio.CancelledError:
+            pass
+        await asyncio.to_thread(backup_database)
         for task in deposit_watch_tasks.values():
             task.cancel()
         await api.close()
