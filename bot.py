@@ -80,6 +80,7 @@ BACKUP_KEEP = max(1, int(os.getenv("BOT_BACKUP_KEEP", "14")))
 BACKUP_INTERVAL_SECONDS = max(300, int(os.getenv("BOT_BACKUP_INTERVAL_SECONDS", "21600")))
 BACKUP_DAILY_TIME = os.getenv("BOT_BACKUP_DAILY_TIME", "23:00").strip() or "23:00"
 BACKUP_TIMEZONE = os.getenv("BOT_BACKUP_TIMEZONE", "Asia/Ho_Chi_Minh").strip() or "Asia/Ho_Chi_Minh"
+START_COOLDOWN_SECONDS = max(2, int(os.getenv("START_COOLDOWN_SECONDS", "5")))
 PORT = int(os.getenv("PORT", "8000"))
 WEBHOOK_TOKEN = os.getenv("SEPAY_WEBHOOK_TOKEN", "").strip()
 SEPAY_FORWARD_URL = os.getenv("SEPAY_FORWARD_URL", "").strip().rstrip("/")
@@ -262,6 +263,7 @@ deposit_watch_tasks: dict[tuple[int, str], asyncio.Task[Any]] = {}
 deposit_notified: set[tuple[int, str]] = set()
 admin_notified_orders: set[str] = set()
 badge_menus: dict[int, CatalogMenu] = {}
+last_start_at: dict[int, float] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1085,6 +1087,12 @@ async def show_catalog(message: Message, *, edit: bool = False, telegram_id: int
 
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    now = time.monotonic()
+    last_start = last_start_at.get(user_id, 0.0)
+    if now - last_start < START_COOLDOWN_SECONDS:
+        return
+    last_start_at[user_id] = now
     await state.clear()
     await show_home(message)
     await show_catalog(message)
