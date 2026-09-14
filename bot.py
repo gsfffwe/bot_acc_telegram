@@ -91,6 +91,7 @@ DEPOSIT_WATCH_SECONDS = max(60, int(os.getenv("DEPOSIT_WATCH_SECONDS", "900")))
 DEPOSIT_POLL_SECONDS = max(3, int(os.getenv("DEPOSIT_POLL_SECONDS", "5")))
 SUPPORT_HANDLE = os.getenv("SUPPORT_TELEGRAM", "@tai_khoan_xin").strip() or "@tai_khoan_xin"
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
+HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -129,6 +130,7 @@ class WebApi:
         self.shared_secret = shared_secret
         self.client = httpx.AsyncClient(
             timeout=HTTP_TIMEOUT,
+            limits=HTTP_LIMITS,
             follow_redirects=True,
             headers={
                 "Accept": "application/json",
@@ -262,6 +264,9 @@ deposit_watch_tasks: dict[tuple[int, str], asyncio.Task[Any]] = {}
 deposit_notified: set[tuple[int, str]] = set()
 admin_notified_orders: set[str] = set()
 badge_menus: dict[int, CatalogMenu] = {}
+user_touch_cache: dict[int, tuple[float, str, str]] = {}
+product_badge_cache: dict[str, str] | None = None
+_UNSET = object()
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +274,7 @@ badge_menus: dict[int, CatalogMenu] = {}
 # ---------------------------------------------------------------------------
 
 def init_db() -> None:
+    global product_badge_cache
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute("PRAGMA journal_mode = WAL")
@@ -295,10 +301,20 @@ def init_db() -> None:
             )
             """
         )
+    product_badge_cache = None
 
 
 def touch_user(telegram_id: int, display_name: str = "", username: str = "") -> None:
     now = int(time.time())
+    clean_display_name = str(display_name or "").strip()
+    clean_username = str(username or "").strip()
+    cached = user_touch_cache.get(int(telegram_id))
+    if cached and now - cached[0] < 60 and (
+        not clean_display_name or clean_display_name == cached[1]
+    ) and (
+        not clean_username or clean_username == cached[2]
+    ):
+        return
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute(
             """
@@ -309,8 +325,9 @@ def touch_user(telegram_id: int, display_name: str = "", username: str = "") -> 
                 display_name = CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE telegram_users.display_name END,
                 username = CASE WHEN excluded.username <> '' THEN excluded.username ELSE telegram_users.username END
             """,
-            (telegram_id, now, now, str(display_name or "").strip(), str(username or "").strip()),
+            (telegram_id, now, now, clean_display_name, clean_username),
         )
+    user_touch_cache[int(telegram_id)] = (float(now), clean_display_name, clean_username)
 
 
 def backup_database() -> Path | None:
@@ -450,20 +467,30 @@ def normalize_product_badge(value: str) -> str:
 
 
 def product_badge(product: dict[str, Any]) -> str:
+    global product_badge_cache
     key = product_key(product)
     if key:
-        try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                row = conn.execute("SELECT badge FROM product_badges WHERE product_id = ?", (key,)).fetchone()
-            if row and str(row[0] or "").strip():
-                return str(row[0]).strip()
-        except sqlite3.Error:
-            LOGGER.debug("Product badge table is not ready yet")
+        if product_badge_cache is None:
+            try:
+                with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                    rows = conn.execute("SELECT product_id, badge FROM product_badges").fetchall()
+                product_badge_cache = {
+                    str(row[0]).strip(): str(row[1]).strip()
+                    for row in rows
+                    if str(row[0] or "").strip() and str(row[1] or "").strip()
+                }
+            except sqlite3.Error:
+                LOGGER.debug("Product badge table is not ready yet")
+                product_badge_cache = {}
+        custom_badge = product_badge_cache.get(key)
+        if custom_badge:
+            return custom_badge
     fallback = normalize_product_badge(str(product.get("badge") or product.get("icon") or product.get("emoji") or ""))
     return fallback or "📦"
 
 
 def save_product_badge(product_id: str, badge: str | None) -> None:
+    global product_badge_cache
     key = str(product_id or "").strip()
     if not key:
         return
@@ -479,6 +506,11 @@ def save_product_badge(product_id: str, badge: str | None) -> None:
             )
         else:
             conn.execute("DELETE FROM product_badges WHERE product_id = ?", (key,))
+    if product_badge_cache is not None:
+        if badge:
+            product_badge_cache[key] = normalize_product_badge(badge)
+        else:
+            product_badge_cache.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1017,6 +1049,7 @@ async def show_home(
     edit: bool = False,
     telegram_id: int | None = None,
     display_name: str | None = None,
+    balance_data: dict[str, Any] | object = _UNSET,
 ) -> None:
     user_id = telegram_id or message.from_user.id
     if telegram_id is None:
@@ -1024,11 +1057,16 @@ async def show_home(
     else:
         touch_user(user_id, display_name or "")
     balance_label = "Đang cập nhật"
-    try:
-        data = await api.balance(user_id)
-        balance_label = money(data.get("balance"))
-    except ApiError as exc:
-        LOGGER.warning("Could not load balance for home screen: %s", exc.code)
+    if balance_data is not _UNSET:
+        data = balance_data if isinstance(balance_data, dict) else {}
+        if "balance" in data:
+            balance_label = money(data.get("balance"))
+    else:
+        try:
+            data = await api.balance(user_id)
+            balance_label = money(data.get("balance"))
+        except ApiError as exc:
+            LOGGER.warning("Could not load balance for home screen: %s", exc.code)
 
     name = html.escape(short_text(display_name or message.from_user.full_name or "bạn", 32))
     text = (
@@ -1046,14 +1084,20 @@ async def show_home(
     else:
         await message.answer(text, reply_markup=main_keyboard(user_id))
 
-async def show_catalog(message: Message, *, edit: bool = False, telegram_id: int | None = None) -> None:
+async def show_catalog(
+    message: Message,
+    *,
+    edit: bool = False,
+    telegram_id: int | None = None,
+    catalog_data: dict[str, Any] | object = _UNSET,
+) -> None:
     try:
         user_id = telegram_id or message.from_user.id
         if telegram_id is None:
             remember_user(message.from_user)
         else:
             touch_user(user_id)
-        data = await api.catalog(user_id)
+        data = catalog_data if catalog_data is not _UNSET and isinstance(catalog_data, dict) else await api.catalog(user_id)
         products = [item for item in data.get("products", []) if isinstance(item, dict)]
         menu = CatalogMenu(
             key=secrets.token_hex(3),
@@ -1086,8 +1130,24 @@ async def show_catalog(message: Message, *, edit: bool = False, telegram_id: int
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await show_home(message)
-    await show_catalog(message)
+    user_id = message.from_user.id
+    balance_task = asyncio.create_task(api.balance(user_id))
+    catalog_task = asyncio.create_task(api.catalog(user_id))
+
+    try:
+        balance_data = await balance_task
+    except ApiError as exc:
+        LOGGER.warning("Could not preload balance for /start: %s", exc.code)
+        balance_data = {}
+    await show_home(message, balance_data=balance_data)
+
+    try:
+        catalog_data = await catalog_task
+    except ApiError as exc:
+        LOGGER.warning("Could not preload catalog for /start: %s", exc.code)
+        await handle_api_error(message, exc)
+        return
+    await show_catalog(message, catalog_data=catalog_data)
 
 
 @dp.message(Command("home"))
