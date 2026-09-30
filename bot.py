@@ -112,6 +112,11 @@ class AdminStates(StatesGroup):
     broadcast = State()
     confirm_broadcast = State()
     product_badge = State()
+    balance_target = State()
+    balance_action = State()
+    balance_amount = State()
+    balance_note = State()
+    balance_confirm = State()
 
 
 class ApiError(RuntimeError):
@@ -210,6 +215,28 @@ class WebApi:
 
     async def admin_stats(self, telegram_id: int) -> dict[str, Any]:
         return await self.request("GET", "/telegram/admin/stats", telegram_id)
+
+    async def adjust_member_balance(
+        self,
+        admin_telegram_id: int,
+        target_telegram_id: int,
+        action: str,
+        amount: int,
+        note: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            "/telegram/admin/balance-adjust",
+            admin_telegram_id,
+            payload={
+                "telegramId": str(target_telegram_id),
+                "action": action,
+                "amount": amount,
+                "note": note,
+                "requestId": request_id,
+            },
+        )
 
     async def create_deposit(self, telegram_id: int, amount: int) -> dict[str, Any]:
         return await self.request("POST", "/telegram/deposit", telegram_id, payload={"amount": amount})
@@ -1272,6 +1299,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Làm mới thống kê", callback_data="admin_dashboard")],
             [InlineKeyboardButton(text="👥 Danh sách khách hàng", callback_data="admin_users")],
+            [InlineKeyboardButton(text="💸 Cộng / trừ số dư", callback_data="admin_balance_adjust")],
             [InlineKeyboardButton(text="📣 Gửi thông báo", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="🏷️ Gán nhãn sản phẩm", callback_data="admin_badges")],
             [InlineKeyboardButton(text="💾 Gửi backup ngay", callback_data="admin_backup_now")],
@@ -1287,6 +1315,33 @@ def admin_broadcast_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✅ Gửi đến khách hàng", callback_data="admin_broadcast_confirm"),
                 InlineKeyboardButton(text="❌ Hủy", callback_data="admin_broadcast_cancel"),
             ]
+        ]
+    )
+
+
+def admin_balance_action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Cộng tiền", callback_data="admin_balance_action|credit"),
+                InlineKeyboardButton(text="➖ Trừ tiền", callback_data="admin_balance_action|debit"),
+            ],
+            [InlineKeyboardButton(text="❌ Hủy", callback_data="admin_balance_cancel")],
+        ]
+    )
+
+
+def admin_balance_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Hủy", callback_data="admin_balance_cancel")]]
+    )
+
+
+def admin_balance_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Xác nhận cập nhật số dư", callback_data="admin_balance_confirm")],
+            [InlineKeyboardButton(text="❌ Hủy", callback_data="admin_balance_cancel")],
         ]
     )
 
@@ -1367,6 +1422,7 @@ async def admin_dashboard_text(admin_id: int) -> str:
         f"💳 Lượt nạp thành công: <b>{int(summary.get('deposits') or 0)}</b>",
         f"📥 Tổng tiền đã nạp: <b>{money(summary.get('depositedAmount'))}</b>",
         f"💼 Tổng số dư khách: <b>{money(summary.get('balances'))}</b>",
+        f"🛠 Điều chỉnh thủ công: <b>+{money(summary.get('manualCreditTotal'))} · -{money(summary.get('manualDebitTotal'))}</b>",
         "",
         "<b>Khách hoạt động gần đây</b>",
     ]
@@ -1428,10 +1484,15 @@ async def admin_users_text(admin_id: int) -> str:
             balance_text = money(balance_value) if balance_value is not None else "Chưa đồng bộ"
             status = str(record.get("status") or "")
             status_line = f" · {html.escape(status)}" if status else ""
+            manual_credit = money(record.get("manualCreditTotal"))
+            manual_debit = money(record.get("manualDebitTotal"))
+            manual_line = ""
+            if int(float(record.get("manualCreditTotal") or 0)) or int(float(record.get("manualDebitTotal") or 0)):
+                manual_line = f"\n   Điều chỉnh: <b>+{manual_credit} · -{manual_debit}</b>"
             lines.append(
                 f"<b>{index}. {html.escape(display_name)}</b>\n"
                 f"   ID: <code>{user_id}</code> · Số dư: <b>{balance_text}</b>{status_line}\n"
-                f"   Hoạt động: {vi_time(record.get('lastSeenAt'))}"
+                f"   Hoạt động: {vi_time(record.get('lastSeenAt'))}{manual_line}"
             )
     if len(rows) > 50:
         lines.extend(["", f"… còn {len(rows) - 50} khách hàng khác."])
@@ -1455,6 +1516,267 @@ async def admin_handler(message: Message) -> None:
         )
     except ApiError as exc:
         await handle_api_error(message, exc)
+
+
+def admin_balance_adjustment_error_message(exc: ApiError) -> str:
+    messages = {
+        "TELEGRAM_BOT_ADMIN_NOT_CONFIGURED": (
+            "Chưa cấu hình <code>TELEGRAM_BOT_ADMIN_IDS</code> trên Netlify. "
+            "Hãy đặt ID admin giống biến <code>ADMIN_TELEGRAM_IDS</code> của bot rồi deploy lại Netlify."
+        ),
+        "TELEGRAM_ADMIN_REQUIRED": "Telegram ID này chưa được cấp quyền điều chỉnh số dư trên Netlify.",
+        "TELEGRAM_MEMBER_NOT_FOUND": "Chưa tìm thấy khách trong bot. Hãy yêu cầu khách gửi /start trước.",
+        "INSUFFICIENT_BALANCE": "Số dư khách không đủ để trừ số tiền này.",
+        "TELEGRAM_BALANCE_INVALID": "Số dư khách hiện không hợp lệ, chưa thể điều chỉnh.",
+        "BALANCE_ADJUSTMENT_ID_CONFLICT": "Phiên xác nhận đã bị trùng với một thao tác khác. Hãy tạo lại thao tác.",
+    }
+    return messages.get(exc.code, exc.message)
+
+
+async def begin_admin_balance_adjustment(message: Message, state: FSMContext, admin_id: int) -> None:
+    if not is_admin(admin_id):
+        await message.answer(
+            "Bạn không có quyền cộng hoặc trừ số dư.",
+            reply_markup=main_keyboard(admin_id),
+        )
+        return
+    await state.clear()
+    await state.set_state(AdminStates.balance_target)
+    await message.answer(
+        "💸 <b>CỘNG / TRỪ SỐ DƯ KHÁCH</b>\n"
+        f"{UI_DIVIDER}\n"
+        "Gửi <b>Telegram ID</b> của khách cần điều chỉnh.\n"
+        "Khách cần từng gửi /start cho bot để có ví riêng.\n\n"
+        "Ví dụ: <code>123456789</code>",
+        reply_markup=admin_balance_cancel_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "admin_balance_adjust")
+async def admin_balance_adjust_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        await begin_admin_balance_adjustment(callback.message, state, callback.from_user.id)
+
+
+@dp.message(Command("money"))
+async def money_command_handler(message: Message, state: FSMContext) -> None:
+    await begin_admin_balance_adjustment(message, state, message.from_user.id)
+
+
+@dp.message(AdminStates.balance_target)
+async def admin_balance_target_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw_target = str(message.text or "").strip()
+    if not re.fullmatch(r"\d{1,30}", raw_target) or int(raw_target) <= 0:
+        await message.answer("Telegram ID chỉ gồm chữ số. Vui lòng gửi lại ID của khách.")
+        return
+    await state.update_data(balance_target_telegram_id=raw_target)
+    await state.set_state(AdminStates.balance_action)
+    await message.answer(
+        "Chọn thao tác cho khách <code>" + html.escape(raw_target) + "</code>.",
+        reply_markup=admin_balance_action_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_balance_action|"))
+async def admin_balance_action_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    if await state.get_state() != AdminStates.balance_action.state:
+        await callback.answer("Phiên điều chỉnh đã hết hạn. Hãy mở lại mục Cộng / trừ số dư.", show_alert=True)
+        return
+    action = str(callback.data or "").split("|", 1)[-1]
+    if action not in {"credit", "debit"}:
+        await callback.answer("Thao tác không hợp lệ.", show_alert=True)
+        return
+    data = await state.get_data()
+    target = str(data.get("balance_target_telegram_id") or "")
+    if not re.fullmatch(r"\d{1,30}", target):
+        await state.clear()
+        await callback.answer("Không tìm thấy Telegram ID của khách. Hãy làm lại.", show_alert=True)
+        return
+    await state.update_data(balance_action=action)
+    await state.set_state(AdminStates.balance_amount)
+    action_text = "cộng" if action == "credit" else "trừ"
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            f"Nhập số tiền muốn <b>{action_text}</b> cho khách <code>{html.escape(target)}</code>.\n"
+            "Ví dụ: <code>50000</code>"
+        )
+
+
+@dp.message(AdminStates.balance_amount)
+async def admin_balance_amount_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    amount = parse_amount(str(message.text or ""))
+    if amount <= 0:
+        await message.answer("Số tiền phải lớn hơn 0. Vui lòng nhập lại.")
+        return
+    if amount > 100_000_000:
+        await message.answer("Mỗi lần chỉ có thể cộng hoặc trừ tối đa 100.000.000đ.")
+        return
+    data = await state.get_data()
+    target = str(data.get("balance_target_telegram_id") or "")
+    action = str(data.get("balance_action") or "")
+    if not re.fullmatch(r"\d{1,30}", target) or action not in {"credit", "debit"}:
+        await state.clear()
+        await message.answer("Phiên điều chỉnh đã hết hạn. Hãy mở lại từ mục quản trị.", reply_markup=admin_keyboard())
+        return
+    await state.update_data(balance_amount=amount)
+    await state.set_state(AdminStates.balance_note)
+    await message.answer(
+        "Gửi ghi chú sẽ hiển thị cho khách (không bắt buộc).\n"
+        "Ví dụ: <code>Ưu đãi khách hàng</code>\n"
+        "Gửi <code>-</code> nếu không cần ghi chú.",
+        reply_markup=admin_balance_cancel_keyboard(),
+    )
+
+
+@dp.message(AdminStates.balance_note)
+async def admin_balance_note_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw_note = str(message.text or "").strip()
+    note = "" if raw_note.casefold() in {"-", "bo qua", "bỏ qua", "skip", "none"} else raw_note
+    if len(note) > 300:
+        await message.answer("Ghi chú tối đa 300 ký tự. Vui lòng gửi lại hoặc gửi <code>-</code> để bỏ qua.")
+        return
+    data = await state.get_data()
+    target = str(data.get("balance_target_telegram_id") or "")
+    action = str(data.get("balance_action") or "")
+    try:
+        amount = int(data.get("balance_amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    if not re.fullmatch(r"\d{1,30}", target) or action not in {"credit", "debit"} or amount <= 0:
+        await state.clear()
+        await message.answer("Phiên điều chỉnh đã hết hạn. Hãy mở lại từ mục quản trị.", reply_markup=admin_keyboard())
+        return
+    request_id = "adj_" + secrets.token_urlsafe(18)
+    await state.update_data(balance_note=note, balance_request_id=request_id)
+    await state.set_state(AdminStates.balance_confirm)
+    action_text = "CỘNG" if action == "credit" else "TRỪ"
+    note_text = html.escape(note) if note else "Không có"
+    await message.answer(
+        "⚠️ <b>XÁC NHẬN CẬP NHẬT SỐ DƯ</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"Khách: <code>{html.escape(target)}</code>\n"
+        f"Thao tác: <b>{action_text}</b>\n"
+        f"Số tiền: <b>{money(amount)}</b>\n"
+        f"Ghi chú: {note_text}\n\n"
+        "Thao tác sẽ lưu lịch sử và không thể tự hoàn tác. Hãy kiểm tra kỹ trước khi xác nhận.",
+        reply_markup=admin_balance_confirm_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "admin_balance_confirm")
+async def admin_balance_confirm_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    if await state.get_state() != AdminStates.balance_confirm.state:
+        await callback.answer("Phiên điều chỉnh đã hết hạn. Hãy tạo thao tác mới.", show_alert=True)
+        return
+    data = await state.get_data()
+    target = str(data.get("balance_target_telegram_id") or "")
+    action = str(data.get("balance_action") or "")
+    note = str(data.get("balance_note") or "")
+    request_id = str(data.get("balance_request_id") or "")
+    try:
+        amount = int(data.get("balance_amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    if (
+        not re.fullmatch(r"\d{1,30}", target)
+        or action not in {"credit", "debit"}
+        or amount <= 0
+        or not re.fullmatch(r"[A-Za-z0-9_-]{12,80}", request_id)
+    ):
+        await state.clear()
+        await callback.answer("Dữ liệu xác nhận không hợp lệ. Hãy tạo thao tác mới.", show_alert=True)
+        return
+
+    await callback.answer("Đang cập nhật số dư…")
+    try:
+        result = await api.adjust_member_balance(
+            callback.from_user.id,
+            int(target),
+            action,
+            amount,
+            note,
+            request_id,
+        )
+    except ApiError as exc:
+        await state.clear()
+        if callback.message:
+            await callback.message.edit_text(
+                "⚠️ <b>CHƯA CẬP NHẬT SỐ DƯ</b>\n"
+                f"{UI_DIVIDER}\n"
+                f"{admin_balance_adjustment_error_message(exc)}",
+                reply_markup=admin_keyboard(),
+            )
+        return
+
+    await state.clear()
+    action_text = "đã cộng" if action == "credit" else "đã trừ"
+    idempotent_note = (
+        "\n\nℹ️ Yêu cầu này đã được xác nhận trước đó; số dư không bị thay đổi lần hai."
+        if result.get("idempotent")
+        else ""
+    )
+    customer_notified = False
+    if not result.get("idempotent") and bot and int(target) != callback.from_user.id:
+        try:
+            customer_note = f"\n📝 Ghi chú: {html.escape(note)}" if note else ""
+            await bot.send_message(
+                int(target),
+                "💳 <b>SỐ DƯ ĐÃ ĐƯỢC CẬP NHẬT</b>\n"
+                f"{UI_DIVIDER}\n"
+                f"Admin {action_text} <b>{money(amount)}</b> vào ví của bạn.\n"
+                f"💰 Số dư hiện tại: <b>{money(result.get('balance'))}</b>"
+                f"{customer_note}",
+            )
+            customer_notified = True
+        except Exception:
+            LOGGER.warning("Could not notify Telegram user %s about manual balance adjustment", target)
+
+    notification_text = "Đã gửi thông báo cho khách." if customer_notified else "Không gửi được thông báo cho khách."
+    if int(target) == callback.from_user.id:
+        notification_text = "Đây là ví của chính bạn nên bot không gửi thông báo riêng."
+    if callback.message:
+        await callback.message.edit_text(
+            "✅ <b>ĐÃ CẬP NHẬT SỐ DƯ</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"Khách: <code>{html.escape(target)}</code>\n"
+            f"Đã {action_text}: <b>{money(amount)}</b>\n"
+            f"Số dư trước: <b>{money(result.get('balanceBefore'))}</b>\n"
+            f"Số dư hiện tại: <b>{money(result.get('balance'))}</b>\n"
+            f"Mã tham chiếu: <code>{html.escape(str(result.get('id') or request_id))}</code>\n\n"
+            f"{notification_text}{idempotent_note}",
+            reply_markup=admin_keyboard(),
+        )
+
+
+@dp.callback_query(F.data == "admin_balance_cancel")
+async def admin_balance_cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Đã hủy.")
+    if callback.message:
+        await callback.message.edit_text("Đã hủy thao tác cộng / trừ số dư.", reply_markup=admin_keyboard())
 
 
 @dp.message(Command("backup"))
@@ -2529,6 +2851,7 @@ async def main() -> None:
                 BotCommand(command="support", description="Liên hệ hỗ trợ"),
                 BotCommand(command="admin", description="Quản trị shop"),
                 BotCommand(command="users", description="Danh sách khách hàng"),
+                BotCommand(command="money", description="Cộng hoặc trừ số dư khách"),
                 BotCommand(command="badges", description="Gán icon sản phẩm"),
                 BotCommand(command="broadcast", description="Gửi thông báo cho khách"),
                 BotCommand(command="backup", description="Gửi backup dữ liệu"),
