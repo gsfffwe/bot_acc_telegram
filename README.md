@@ -16,9 +16,12 @@ Trong biến môi trường Production của Netlify, giữ nguyên các biến 
 
 ```text
 TELEGRAM_BOT_SHARED_SECRET=chuoi-bi-mat-it-nhat-32-ky-tu
+TELEGRAM_BOT_ADMIN_IDS=123456789,987654321
 ```
 
 Sau khi đổi biến môi trường, cần deploy lại website để Netlify Function nhận giá trị mới.
+
+`TELEGRAM_BOT_ADMIN_IDS` là Telegram ID của các admin được phép cộng/trừ số dư. Giá trị này phải giống danh sách `ADMIN_TELEGRAM_IDS` (hoặc `ADMIN_TELEGRAM_ID`) của bot. Biến này được kiểm tra trực tiếp tại Netlify, nên người không phải admin không thể tự gọi API tài chính dù biết đường dẫn API.
 
 Mỗi yêu cầu nạp tiền tạo một nội dung chuyển khoản riêng theo dạng `Chuyentien_12345` (5 chữ số). Bot sẽ tự nhận diện nội dung này từ webhook thanh toán và cộng đúng vào ví Telegram tương ứng.
 
@@ -57,6 +60,17 @@ Admin dùng đúng số Telegram ID (không phải username) trong `ADMIN_TELEGR
 - lượt nạp, tổng tiền đã nạp và số dư khách;
 - danh sách khách hoạt động gần đây.
 
+### Cộng hoặc trừ số dư khách
+
+Từ `/admin`, bấm **💸 Cộng / trừ số dư** (hoặc gửi lệnh `/money`), rồi lần lượt:
+
+1. gửi Telegram ID của khách;
+2. chọn **Cộng tiền** hoặc **Trừ tiền**;
+3. nhập số tiền và ghi chú tùy chọn;
+4. kiểm tra màn hình xác nhận trước khi bấm cập nhật.
+
+Khách cần từng gửi `/start` để bot có ví Telegram riêng. Mỗi điều chỉnh được ghi lịch sử vào Firebase kèm Telegram ID admin, số dư trước/sau và mã tham chiếu; bấm lại cùng nút xác nhận không cộng/trừ lần hai. Khách cũng nhận thông báo số dư mới sau khi thao tác thành công.
+
 Mỗi đơn hoàn tất được gửi cho khách và bot đồng thời gửi đầy đủ thông tin đơn cùng tài khoản đã cấp cho admin.
 
 Bot hiển thị thông tin hỗ trợ tại `@tai_khoan_xin` (có thể đổi bằng biến `SUPPORT_TELEGRAM`).
@@ -65,6 +79,8 @@ Bot hiển thị thông tin hỗ trợ tại `@tai_khoan_xin` (có thể đổi 
 
 Trong trang quản trị website, mỗi sản phẩm có thêm trường **Giá riêng trên Telegram (VNĐ)**.
 Bỏ trống trường này để bot dùng giá web. Khi có giá riêng, bot Telegram dùng giá đó cả lúc hiển thị và lúc trừ số dư; giá web và tồn kho vẫn giữ độc lập.
+
+Sản phẩm nguồn **Thủ công** chỉ xuất hiện trong danh sách bot khi đã nhập giá riêng Telegram lớn hơn 0. Khi khách đặt mua, bot trừ số dư và số lượng đang bán, lưu đơn riêng trong `telegramBot/orders`, rồi hiển thị mã đơn, tên sản phẩm, giá, ghi chú và nút mở chat admin để khách gửi mã đơn nhận hàng. Bot cũng gửi thông tin đơn cho admin. Các đơn này chờ admin giao hàng thủ công; sản phẩm web nguồn kho và nhà cung cấp tiếp tục theo luồng giao hàng hiện có.
 
 ## Mã đơn hàng
 

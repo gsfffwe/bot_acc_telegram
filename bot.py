@@ -89,6 +89,8 @@ MAX_QUANTITY = max(1, min(100, int(os.getenv("MAX_QUANTITY", "100"))))
 MIN_DEPOSIT = max(0, int(os.getenv("MIN_DEPOSIT", "0")))
 DEPOSIT_WATCH_SECONDS = max(60, int(os.getenv("DEPOSIT_WATCH_SECONDS", "900")))
 DEPOSIT_POLL_SECONDS = max(3, int(os.getenv("DEPOSIT_POLL_SECONDS", "5")))
+CATALOG_CACHE_TTL_SECONDS = 8
+PROVIDER_STOCK_POLL_SECONDS = max(30, int(os.getenv("PROVIDER_STOCK_POLL_SECONDS", "60")))
 SUPPORT_HANDLE = os.getenv("SUPPORT_TELEGRAM", "@tai_khoan_xin").strip() or "@tai_khoan_xin"
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
 HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0)
@@ -133,6 +135,9 @@ class WebApi:
     def __init__(self, base_url: str, shared_secret: str):
         self.base_url = base_url.rstrip("/")
         self.shared_secret = shared_secret
+        self.catalog_cache: tuple[float, dict[str, Any]] | None = None
+        self.catalog_lock = asyncio.Lock()
+        self.balance_cache: dict[int, tuple[float, dict[str, Any]]] = {}
         self.client = httpx.AsyncClient(
             timeout=HTTP_TIMEOUT,
             limits=HTTP_LIMITS,
@@ -194,10 +199,39 @@ class WebApi:
         return data if isinstance(data, dict) else {"value": data}
 
     async def catalog(self, telegram_id: int) -> dict[str, Any]:
-        return await self.request("GET", "/user/catalog", telegram_id)
+        now = time.monotonic()
+        if self.catalog_cache and now - self.catalog_cache[0] < CATALOG_CACHE_TTL_SECONDS:
+            cached = self.catalog_cache[1]
+            return {**cached, "username": f"tg_{telegram_id}", "channel": "telegram"}
+
+        async with self.catalog_lock:
+            now = time.monotonic()
+            if self.catalog_cache and now - self.catalog_cache[0] < CATALOG_CACHE_TTL_SECONDS:
+                cached = self.catalog_cache[1]
+                return {**cached, "username": f"tg_{telegram_id}", "channel": "telegram"}
+            result = await self.request("GET", "/user/catalog", telegram_id)
+            cached = {
+                "products": [dict(item) for item in result.get("products", []) if isinstance(item, dict)],
+                "discountPercent": int(result.get("discountPercent") or 0),
+            }
+            self.catalog_cache = (time.monotonic(), cached)
+            return {**cached, "username": f"tg_{telegram_id}", "channel": "telegram"}
+
+    def invalidate_catalog(self) -> None:
+        self.catalog_cache = None
 
     async def balance(self, telegram_id: int) -> dict[str, Any]:
-        return await self.request("GET", "/user/balance", telegram_id)
+        cached = self.balance_cache.get(int(telegram_id))
+        if cached and time.monotonic() - cached[0] < 2:
+            return dict(cached[1])
+        result = await self.request("GET", "/user/balance", telegram_id)
+        self.balance_cache[int(telegram_id)] = (time.monotonic(), dict(result))
+        if len(self.balance_cache) > 2048:
+            self.balance_cache.pop(next(iter(self.balance_cache)))
+        return result
+
+    def invalidate_balance(self, telegram_id: int) -> None:
+        self.balance_cache.pop(int(telegram_id), None)
 
     async def orders(self, telegram_id: int) -> dict[str, Any]:
         return await self.request("GET", "/user/orders", telegram_id)
@@ -206,6 +240,14 @@ class WebApi:
         return await self.request(
             "POST",
             "/provider/checkout",
+            telegram_id,
+            payload={"productId": product_id, "orderId": order_id, "quantity": quantity},
+        )
+
+    async def manual_checkout(self, telegram_id: int, product_id: str, order_id: str, quantity: int) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            "/telegram/manual-checkout",
             telegram_id,
             payload={"productId": product_id, "orderId": order_id, "quantity": quantity},
         )
@@ -276,6 +318,8 @@ class PendingPurchase:
     quantity: int
     order_id: str
     expected_total: int
+    delivery_mode: str = "provider"
+    product_note: str = ""
 
 
 api = WebApi(WEB_API_BASE_URL, TELEGRAM_BOT_SHARED_SECRET)
@@ -328,7 +372,70 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provider_stock_snapshots(
+                product_id TEXT PRIMARY KEY,
+                quantity INTEGER NOT NULL,
+                product_name TEXT NOT NULL DEFAULT '',
+                duration TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state(
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT NOT NULL
+            )
+            """
+        )
     product_badge_cache = None
+
+
+def load_provider_stock_snapshots() -> tuple[bool, dict[str, dict[str, Any]]]:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        rows = conn.execute(
+            "SELECT product_id, quantity, product_name, duration FROM provider_stock_snapshots"
+        ).fetchall()
+        state = conn.execute(
+            "SELECT state_value FROM bot_state WHERE state_key = 'provider_stock_initialized'"
+        ).fetchone()
+    snapshots = {
+        str(row[0]): {
+            "quantity": max(0, int(row[1] or 0)),
+            "name": str(row[2] or "Sản phẩm"),
+            "duration": str(row[3] or ""),
+        }
+        for row in rows
+    }
+    return bool(state and state[0] == "1"), snapshots
+
+
+def save_provider_stock_snapshots(snapshots: dict[str, dict[str, Any]]) -> None:
+    rows = [
+        (
+            product_id,
+            max(0, int(item.get("quantity") or 0)),
+            str(item.get("name") or "Sản phẩm")[:180],
+            str(item.get("duration") or "")[:160],
+        )
+        for product_id, item in snapshots.items()
+    ]
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("DELETE FROM provider_stock_snapshots")
+        if rows:
+            conn.executemany(
+                "INSERT INTO provider_stock_snapshots(product_id, quantity, product_name, duration) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+        conn.execute(
+            """
+            INSERT INTO bot_state(state_key, state_value)
+            VALUES ('provider_stock_initialized', '1')
+            ON CONFLICT(state_key) DO UPDATE SET state_value = '1'
+            """
+        )
 
 
 def touch_user(telegram_id: int, display_name: str = "", username: str = "") -> None:
@@ -570,6 +677,11 @@ def support_url() -> str:
     return f"https://t.me/{SUPPORT_HANDLE.lstrip('@')}"
 
 
+def order_support_url(order_id: str) -> str:
+    message = f"Chào admin, tôi cần hỗ trợ đơn hàng {order_id}."
+    return f"{support_url()}?text={quote(message)}"
+
+
 def support_link() -> str:
     """Liên kết mở thẳng cuộc trò chuyện hỗ trợ, không dùng dạng mã sao chép."""
     return (
@@ -721,6 +833,19 @@ def after_purchase_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def manual_order_keyboard(order_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Inbox admin, gửi mã đơn", url=order_support_url(order_id))],
+            [
+                InlineKeyboardButton(text="📦 Sản phẩm", callback_data="products"),
+                InlineKeyboardButton(text="🧾 Đơn hàng", callback_data="orders"),
+            ],
+            [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+        ]
+    )
+
+
 def menu_for_user(user_id: int) -> CatalogMenu | None:
     menu = menus.get(user_id)
     if not menu or time.time() - menu.created_at > 30 * 60:
@@ -782,6 +907,8 @@ def product_text(product: dict[str, Any], discount_percent: int) -> str:
         f"🧾 Định dạng: <code>{fmt}</code>",
         f"🛡 Bảo hành: {warranty}",
     ]
+    if str(product.get("deliveryMode") or "") == "manual":
+        lines.append("🧑‍💼 Giao hàng: Admin xác nhận sau khi đặt")
     if desc:
         lines.extend(["", desc])
     return "\n".join(lines)
@@ -861,11 +988,13 @@ async def notify_admin(text: str) -> None:
     global bot
     if not bot or not ADMIN_TELEGRAM_IDS:
         return
-    for admin_id in sorted(ADMIN_TELEGRAM_IDS):
+    async def send_one(admin_id: int) -> None:
         try:
             await bot.send_message(admin_id, text)
         except Exception:
             LOGGER.exception("Could not notify admin %s", admin_id)
+
+    await asyncio.gather(*(send_one(admin_id) for admin_id in sorted(ADMIN_TELEGRAM_IDS)))
 
 
 def public_error_message(exc: ApiError) -> str:
@@ -917,12 +1046,37 @@ async def notify_admin_order_with_accounts(
         await notify_admin(f"🔐 <b>THÔNG TIN ĐÃ CẤP</b>\n<pre>{escaped[chunk_start : chunk_start + 3700]}</pre>")
 
 
+async def notify_admin_manual_order(
+    telegram_id: int,
+    order_id: str,
+    product_name: str,
+    quantity: int,
+    total: Any,
+    note: str,
+) -> None:
+    note_text = html.escape(note.strip()) if note.strip() else "Không có ghi chú."
+    await notify_admin(
+        "🛒 <b>ĐƠN HÀNG THỦ CÔNG MỚI</b>\n\n"
+        f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+        f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
+        f"📦 Sản phẩm: <b>{html.escape(product_name or 'Sản phẩm')}</b>\n"
+        f"🔢 Số lượng: <b>{quantity}</b>\n"
+        f"💵 Thanh toán: <b>{money(total)}</b>\n"
+        f"📝 Ghi chú: {note_text}\n\n"
+        "⏳ Đơn đang chờ admin xử lý."
+    )
+
+
 async def fetch_order_detail(telegram_id: int, order_id: str) -> dict[str, Any]:
     detail: dict[str, Any] | None = None
     for attempt in range(4):
         try:
             detail = await api.order_detail(telegram_id, order_id)
-            if detail.get("status") == "Hoàn thành" or detail.get("deliveredAccounts"):
+            if (
+                detail.get("status") == "Hoàn thành"
+                or detail.get("deliveredAccounts")
+                or str(detail.get("deliveryMode") or "") == "manual"
+            ):
                 break
         except ApiError:
             if attempt == 3:
@@ -943,6 +1097,40 @@ async def send_purchase_result(
     """Gửi kết quả mua hàng, trả về True khi đã có dữ liệu tài khoản."""
     global bot
     status = str(detail.get("status") or result.get("status") or "Đang xử lý")
+    delivery_mode = str(detail.get("deliveryMode") or result.get("deliveryMode") or "")
+    fulfillment_source = str(detail.get("fulfillmentSource") or result.get("fulfillmentSource") or "")
+    if delivery_mode == "manual" or fulfillment_source == "manual":
+        product_name = str(detail.get("productName") or result.get("productName") or fallback_product_name or "Sản phẩm")
+        product_note = str(detail.get("productNote") or result.get("productNote") or "").strip()
+        total = detail.get("price") or result.get("totalAmount") or expected_total
+        note_text = html.escape(product_note) if product_note else "Không có ghi chú."
+        text = (
+            "✅ <b>ĐẶT HÀNG THÀNH CÔNG</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
+            f"📦 Sản phẩm: <b>{html.escape(product_name)}</b>\n"
+            f"🔢 Số lượng: <b>{int(detail.get('quantity') or result.get('quantity') or 1)}</b>\n"
+            f"💵 Giá: <b>{money(total)}</b>\n"
+            f"📝 Ghi chú: {note_text}\n\n"
+            "⏳ Đơn đang chờ admin xử lý. Vui lòng inbox admin và gửi mã đơn phía trên để nhận hàng."
+        )
+        markup = manual_order_keyboard(order_id)
+        if initial_message:
+            await initial_message.edit_text(text, reply_markup=markup)
+        elif bot:
+            await bot.send_message(telegram_id, text, reply_markup=markup)
+        if order_id not in admin_notified_orders and not result.get("idempotent"):
+            admin_notified_orders.add(order_id)
+            await notify_admin_manual_order(
+                telegram_id,
+                order_id,
+                product_name,
+                int(detail.get("quantity") or result.get("quantity") or 1),
+                total,
+                product_note,
+            )
+        return True
+
     accounts = detail.get("deliveredAccounts")
     if not isinstance(accounts, list):
         accounts = []
@@ -1007,8 +1195,16 @@ async def resume_pending_purchase(telegram_id: int, pending: PendingPurchase) ->
                 telegram_id,
                 f"⏳ Đã đủ số dư. Bot đang tự động xử lý <b>{html.escape(pending.product_name)}</b>…",
             )
-        result = await api.checkout(telegram_id, pending.product_id, pending.order_id, pending.quantity)
-        detail = await fetch_order_detail(telegram_id, pending.order_id)
+        if pending.delivery_mode == "manual":
+            result = await api.manual_checkout(telegram_id, pending.product_id, pending.order_id, pending.quantity)
+            detail = result
+        else:
+            result = await api.checkout(telegram_id, pending.product_id, pending.order_id, pending.quantity)
+            api.invalidate_balance(telegram_id)
+            api.invalidate_catalog()
+            detail = await fetch_order_detail(telegram_id, pending.order_id)
+        api.invalidate_balance(telegram_id)
+        api.invalidate_catalog()
         await send_purchase_result(
             telegram_id,
             result,
@@ -1066,7 +1262,7 @@ def catalog_text(menu: CatalogMenu, page: int) -> str:
         "📦 <b>DANH MỤC SẢN PHẨM</b>\n"
         f"{UI_DIVIDER}\n"
         f"🛒 {len(menu.products)} sản phẩm · Trang <b>{page + 1}/{total_pages}</b>\n\n"
-        "Chọn sản phẩm để xem thông tin, thời hạn và mua tự động."
+        "Chọn sản phẩm để xem thông tin, thời hạn và cách nhận hàng."
     )
 
 
@@ -1077,7 +1273,7 @@ async def show_home(
     telegram_id: int | None = None,
     display_name: str | None = None,
     balance_data: dict[str, Any] | object = _UNSET,
-) -> None:
+) -> Message:
     user_id = telegram_id or message.from_user.id
     if telegram_id is None:
         remember_user(message.from_user)
@@ -1107,9 +1303,8 @@ async def show_home(
         f"{support_line()}"
     )
     if edit:
-        await message.edit_text(text, reply_markup=home_inline_keyboard())
-    else:
-        await message.answer(text, reply_markup=main_keyboard(user_id))
+        return await message.edit_text(text, reply_markup=home_inline_keyboard())
+    return await message.answer(text, reply_markup=main_keyboard(user_id))
 
 async def show_catalog(
     message: Message,
@@ -1158,23 +1353,41 @@ async def show_catalog(
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
     user_id = message.from_user.id
-    balance_task = asyncio.create_task(api.balance(user_id))
-    catalog_task = asyncio.create_task(api.catalog(user_id))
+    home_message = await show_home(message, balance_data={})
 
-    try:
-        balance_data = await balance_task
-    except ApiError as exc:
-        LOGGER.warning("Could not preload balance for /start: %s", exc.code)
-        balance_data = {}
-    await show_home(message, balance_data=balance_data)
+    async def load_start_data() -> None:
+        balance_result, catalog_result = await asyncio.gather(
+            api.balance(user_id),
+            api.catalog(user_id),
+            return_exceptions=True,
+        )
+        balance_data: dict[str, Any] = {}
+        if isinstance(balance_result, Exception):
+            LOGGER.warning("Could not preload balance for /start: %s", getattr(balance_result, "code", "unknown"))
+        else:
+            balance_data = balance_result
+        try:
+            await show_home(
+                home_message,
+                edit=True,
+                telegram_id=user_id,
+                display_name=message.from_user.full_name,
+                balance_data=balance_data,
+            )
+        except Exception:
+            LOGGER.debug("Could not refresh the /start home message", exc_info=True)
 
-    try:
-        catalog_data = await catalog_task
-    except ApiError as exc:
-        LOGGER.warning("Could not preload catalog for /start: %s", exc.code)
-        await handle_api_error(message, exc)
-        return
-    await show_catalog(message, catalog_data=catalog_data)
+        if isinstance(catalog_result, Exception):
+            LOGGER.warning("Could not preload catalog for /start: %s", getattr(catalog_result, "code", "unknown"))
+            if isinstance(catalog_result, ApiError):
+                await handle_api_error(message, catalog_result)
+            return
+        try:
+            await show_catalog(message, catalog_data=catalog_result)
+        except Exception:
+            LOGGER.exception("Could not send the /start catalog")
+
+    asyncio.create_task(load_start_data())
 
 
 @dp.message(Command("home"))
@@ -1717,6 +1930,7 @@ async def admin_balance_confirm_callback(callback: CallbackQuery, state: FSMCont
             note,
             request_id,
         )
+        api.invalidate_balance(int(target))
     except ApiError as exc:
         await state.clear()
         if callback.message:
@@ -1811,15 +2025,16 @@ async def admin_dashboard_callback(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Bạn không có quyền.", show_alert=True)
         return
+    await callback.answer("Đang tải thống kê…")
     try:
         if callback.message:
             await callback.message.edit_text(
                 await admin_dashboard_text(callback.from_user.id),
                 reply_markup=admin_keyboard(),
             )
-        await callback.answer("Đã cập nhật thống kê.")
     except ApiError as exc:
-        await callback.answer(public_error_message(exc)[:180], show_alert=True)
+        if callback.message:
+            await callback.message.answer(f"⚠️ {html.escape(public_error_message(exc))}")
 
 
 @dp.callback_query(F.data == "admin_users")
@@ -1827,6 +2042,7 @@ async def admin_users_callback(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Bạn không có quyền.", show_alert=True)
         return
+    await callback.answer("Đang tải danh sách…")
     try:
         text = await admin_users_text(callback.from_user.id)
         if callback.message:
@@ -1836,9 +2052,9 @@ async def admin_users_callback(callback: CallbackQuery) -> None:
                 await callback.message.answer(chunk)
             if len(chunks) > 1:
                 await callback.message.answer(chunks[-1], reply_markup=admin_keyboard())
-        await callback.answer()
     except ApiError as exc:
-        await callback.answer(public_error_message(exc)[:180], show_alert=True)
+        if callback.message:
+            await callback.message.answer(f"⚠️ {html.escape(public_error_message(exc))}")
 
 
 @dp.callback_query(F.data == "admin_badges")
@@ -1846,12 +2062,13 @@ async def admin_badges_callback(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Bạn không có quyền.", show_alert=True)
         return
+    await callback.answer("Đang tải sản phẩm…")
     try:
         if callback.message:
             await render_admin_badges(callback.message, callback.from_user.id, edit=True)
-        await callback.answer()
     except ApiError as exc:
-        await callback.answer(public_error_message(exc)[:180], show_alert=True)
+        if callback.message:
+            await callback.message.answer(f"⚠️ {html.escape(public_error_message(exc))}")
 
 
 @dp.message(Command("badges"))
@@ -2057,6 +2274,120 @@ async def broadcast_payload(payload: dict[str, Any], admin_id: int) -> tuple[int
     return sent, failed
 
 
+def provider_restock_messages(changes: list[dict[str, Any]]) -> list[str]:
+    header = "📦 <b>SẢN PHẨM VỪA CÓ THÊM HÀNG</b>\n" + UI_DIVIDER + "\n\n"
+    messages: list[str] = []
+    current = header
+    for item in changes:
+        block = (
+            f"🛍 <b>{html.escape(str(item.get('name') or 'Sản phẩm'))}</b>\n"
+            f"📈 Vừa thêm: <b>+{int(item.get('added') or 0)}</b> · Hiện còn: <b>{int(item.get('quantity') or 0)}</b>\n"
+            f"⏳ Thời hạn: <b>{html.escape(str(item.get('duration') or 'Theo mô tả sản phẩm'))}</b>\n\n"
+        )
+        if len(current) + len(block) > 3600 and current != header:
+            messages.append(current.rstrip())
+            current = header
+        current += block
+    if current != header:
+        messages.append(current.rstrip())
+    return messages
+
+
+async def send_provider_restock_notifications(
+    changes: list[dict[str, Any]],
+    watcher_id: int,
+) -> None:
+    global bot
+    if not changes:
+        return
+    messages = provider_restock_messages(changes)
+    if not messages:
+        return
+
+    if bot:
+        try:
+            recipients = await broadcast_recipient_ids(watcher_id)
+        except Exception:
+            LOGGER.exception("Could not load recipients for provider restock notice")
+            recipients = []
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🛍 Xem sản phẩm", callback_data="products")]]
+        )
+        sent = 0
+        failed = 0
+        for user_id in recipients:
+            try:
+                for index, content in enumerate(messages):
+                    await bot.send_message(
+                        user_id,
+                        content,
+                        reply_markup=markup if index == len(messages) - 1 else None,
+                    )
+                sent += 1
+            except Exception:
+                failed += 1
+                LOGGER.info("Could not send provider restock notice to Telegram user %s", user_id)
+            await asyncio.sleep(0.06)
+        LOGGER.info("Provider restock notice sent to %s users; %s failed", sent, failed)
+
+    for content in messages:
+        await notify_admin(content)
+
+
+async def provider_stock_watch_loop() -> None:
+    while True:
+        try:
+            users = local_users()
+            watcher_id = ADMIN_TELEGRAM_ID or next(iter(users), 0)
+            if watcher_id <= 0:
+                await asyncio.sleep(PROVIDER_STOCK_POLL_SECONDS)
+                continue
+
+            catalog_data = await api.catalog(watcher_id)
+            catalog_products = catalog_data.get("products", [])
+            products = [
+                item for item in catalog_products
+                if isinstance(item, dict)
+                and str(item.get("deliveryMode") or item.get("sourceMode") or "") == "provider"
+                and product_key(item)
+            ]
+            current: dict[str, dict[str, Any]] = {}
+            for product in products:
+                key = product_key(product)
+                current[key] = {
+                    "quantity": max(0, int(float(product.get("quantity") or 0))),
+                    "name": str(product.get("name") or "Sản phẩm")[:180],
+                    "duration": str(product.get("duration") or "Theo mô tả sản phẩm")[:160],
+                }
+
+            initialized, previous = await asyncio.to_thread(load_provider_stock_snapshots)
+            if not initialized:
+                await asyncio.to_thread(save_provider_stock_snapshots, current)
+                LOGGER.info("Provider stock monitor initialized with %s products", len(current))
+            else:
+                changes = []
+                for product_id, item in current.items():
+                    old_quantity = int(previous.get(product_id, {}).get("quantity") or 0)
+                    quantity = int(item["quantity"])
+                    if quantity > old_quantity:
+                        changes.append({
+                            "id": product_id,
+                            "name": item["name"],
+                            "duration": item["duration"],
+                            "added": quantity - old_quantity,
+                            "quantity": quantity,
+                        })
+                await asyncio.to_thread(save_provider_stock_snapshots, current)
+                if changes:
+                    LOGGER.info("Detected provider restock for %s products", len(changes))
+                    await send_provider_restock_notifications(changes, watcher_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Provider stock monitor could not refresh product quantities")
+        await asyncio.sleep(PROVIDER_STOCK_POLL_SECONDS)
+
+
 @dp.callback_query(F.data == "admin_broadcast_confirm")
 async def admin_broadcast_confirm_callback(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
@@ -2190,6 +2521,7 @@ async def notify_deposit_paid(telegram_id: int, data: dict[str, Any]) -> None:
     if not bot:
         return
     memo = str(data.get("memo") or "")
+    api.invalidate_balance(telegram_id)
     key = (telegram_id, memo)
     if key in deposit_notified:
         return
@@ -2284,16 +2616,19 @@ async def deposit_amount_handler(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("deposit_check|"))
 async def deposit_check_callback(callback: CallbackQuery) -> None:
     memo = str(callback.data or "").split("|", 1)[-1]
+    await callback.answer("Đang kiểm tra giao dịch…")
     try:
         data = await api.deposit_status(callback.from_user.id, memo)
         status = str(data.get("status") or "Chờ duyệt")
         if "Auto" in status or status.startswith("Đã duyệt") or int(data.get("creditedAt") or 0) > 0:
             await notify_deposit_paid(callback.from_user.id, data)
-            await callback.answer("Đã cộng tiền vào ví.", show_alert=True)
-        else:
-            await callback.answer("Chưa thấy giao dịch. Hãy kiểm tra đúng số tiền và nội dung.", show_alert=True)
+            if callback.message:
+                await callback.message.answer("✅ Khoản nạp đã được xác nhận và cộng vào số dư.")
+        elif callback.message:
+            await callback.message.answer("Chưa thấy giao dịch. Hãy kiểm tra đúng số tiền và nội dung chuyển khoản.")
     except ApiError as exc:
-        await callback.answer(exc.message[:180], show_alert=True)
+        if callback.message:
+            await callback.message.answer(f"⚠️ {html.escape(exc.message)}")
 
 
 # ---------------------------------------------------------------------------
@@ -2320,11 +2655,11 @@ async def catalog_page_callback(callback: CallbackQuery) -> None:
         return
     total_pages = max(1, (len(menu.products) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
+    await callback.answer()
     await callback.message.edit_text(
         catalog_text(menu, page),
         reply_markup=catalog_keyboard(menu, page),
     )
-    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("product|"))
@@ -2346,11 +2681,11 @@ async def product_detail_callback(callback: CallbackQuery) -> None:
     except (ValueError, IndexError):
         await callback.answer("Sản phẩm không còn trong danh sách.", show_alert=True)
         return
+    await callback.answer()
     await callback.message.edit_text(
         product_text(product, menu.discount_percent),
         reply_markup=product_detail_keyboard(menu, index, product),
     )
-    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("quantity|"))
@@ -2448,16 +2783,74 @@ async def payment_method_callback(callback: CallbackQuery) -> None:
         await callback.answer("Số lượng hiện không còn đủ.", show_alert=True)
         return
     total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+    await callback.answer()
     await callback.message.edit_text(
         "💳 <b>CHỌN PHƯƠNG THỨC THANH TOÁN</b>\n"
         f"{UI_DIVIDER}\n\n"
         f"📦 Sản phẩm: <b>{html.escape(str(product.get('name') or 'Sản phẩm'))}</b>\n"
         f"🔢 Số lượng: <b>{quantity}</b>\n"
         f"💵 Tổng tiền: <b>{money(total)}</b>\n\n"
-        "Bạn có thể dùng số dư sẵn có hoặc chuyển khoản QR đúng số tiền trên đơn.",
+        "Bạn có thể dùng số dư sẵn có hoặc chuyển khoản QR đúng số tiền trên đơn."
+        + (
+            "\n\n🧑‍💼 Sản phẩm thủ công sẽ được admin xác nhận và giao sau khi thanh toán."
+            if str(product.get("deliveryMode") or "") == "manual"
+            else ""
+        ),
         reply_markup=payment_method_keyboard(menu, index, quantity),
     )
-    await callback.answer()
+
+
+async def show_insufficient_balance_prompt(
+    message: Message,
+    telegram_id: int,
+    menu: CatalogMenu,
+    index: int,
+    product: dict[str, Any],
+    quantity: int,
+    attempt_key: tuple[int, str, int, int],
+) -> None:
+    expected_total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+    api.invalidate_balance(telegram_id)
+    try:
+        balance_data = await api.balance(telegram_id)
+        balance = int(float(balance_data.get("balance") or 0))
+        balance_label = money(balance)
+        missing_line = f"Cần nạp thêm: <b>{money(max(0, expected_total - balance))}</b>\n"
+    except ApiError as exc:
+        LOGGER.warning("Could not refresh balance after checkout rejection: %s", exc.code)
+        balance = 0
+        balance_label = "Chưa cập nhật được"
+        missing_line = ""
+
+    order_id = new_order_id()
+    pending_purchases[telegram_id] = PendingPurchase(
+        product_id=str(product.get("id") or ""),
+        product_name=str(product.get("name") or "Sản phẩm"),
+        quantity=quantity,
+        order_id=order_id,
+        expected_total=expected_total,
+        delivery_mode=str(product.get("deliveryMode") or "provider"),
+        product_note=str(product.get("desc") or ""),
+    )
+    purchase_attempts.pop(attempt_key, None)
+    await message.edit_text(
+        "💳 <b>SỐ DƯ CHƯA ĐỦ</b>\n"
+        f"{UI_DIVIDER}\n\n"
+        f"Cần thanh toán: <b>{money(expected_total)}</b>\n"
+        f"Đang có: <b>{balance_label}</b>\n"
+        f"{missing_line}\n"
+        "Chọn QR nhanh để chuyển đúng số tiền của đơn hàng, hoặc nạp một số tiền khác.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📲 QR đúng số tiền đơn", callback_data=f"pay_qr|{menu.key}|{index}|{quantity}")],
+                [InlineKeyboardButton(text="💳 Nạp số tiền khác", callback_data="deposit")],
+                [
+                    InlineKeyboardButton(text="📦 Sản phẩm", callback_data="products"),
+                    InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+                ],
+            ]
+        ),
+    )
 
 
 @dp.callback_query(F.data.startswith("confirm|"))
@@ -2494,40 +2887,22 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
     async with purchase_locks[callback.from_user.id]:
         try:
             await callback.message.edit_text("⏳ <b>ĐANG XỬ LÝ ĐƠN HÀNG</b>\n\nHệ thống đang kiểm tra số dư, tồn kho và chuẩn bị tài khoản cho bạn…")
-            balance_data = await api.balance(callback.from_user.id)
             expected_total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
-            balance = int(float(balance_data.get("balance") or 0))
-            if balance < expected_total:
-                pending_purchases[callback.from_user.id] = PendingPurchase(
-                    product_id=str(product.get("id") or ""),
-                    product_name=str(product.get("name") or "Sản phẩm"),
-                    quantity=quantity,
-                    order_id=order_id,
-                    expected_total=expected_total,
+            if str(product.get("deliveryMode") or "") == "manual":
+                result = await api.manual_checkout(
+                    callback.from_user.id,
+                    str(product.get("id") or ""),
+                    order_id,
+                    quantity,
                 )
-                purchase_attempts.pop(attempt_key, None)
-                await callback.message.edit_text(
-                    "💳 <b>SỐ DƯ CHƯA ĐỦ</b>\n"
-                    f"{UI_DIVIDER}\n\n"
-                    f"Cần khoảng: <b>{money(expected_total)}</b>\n"
-                    f"Đang có: <b>{money(balance)}</b>\n"
-                    f"Cần nạp thêm: <b>{money(expected_total - balance)}</b>\n\n"
-                    "Chọn QR nhanh để chuyển đúng số tiền của đơn hàng, hoặc nạp một số tiền khác.",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(text="📲 QR đúng số tiền đơn", callback_data=f"pay_qr|{menu.key}|{index}|{quantity}")],
-                            [InlineKeyboardButton(text="💳 Nạp số tiền khác", callback_data="deposit")],
-                            [
-                                InlineKeyboardButton(text="📦 Sản phẩm", callback_data="products"),
-                                InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
-                            ],
-                        ]
-                    ),
-                )
-                return
-
-            result = await api.checkout(callback.from_user.id, str(product.get("id") or ""), order_id, quantity)
-            detail = await fetch_order_detail(callback.from_user.id, order_id)
+                detail = result
+            else:
+                result = await api.checkout(callback.from_user.id, str(product.get("id") or ""), order_id, quantity)
+                api.invalidate_balance(callback.from_user.id)
+                api.invalidate_catalog()
+                detail = await fetch_order_detail(callback.from_user.id, order_id)
+            api.invalidate_balance(callback.from_user.id)
+            api.invalidate_catalog()
             await send_purchase_result(
                 callback.from_user.id,
                 result,
@@ -2544,7 +2919,17 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
                 exc.code,
                 exc.message,
             )
-            if exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
+            if exc.code == "INSUFFICIENT_BALANCE":
+                await show_insufficient_balance_prompt(
+                    callback.message,
+                    callback.from_user.id,
+                    menu,
+                    index,
+                    product,
+                    quantity,
+                    attempt_key,
+                )
+            elif exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
                 await notify_admin(
                     "⚠️ <b>ĐƠN HÀNG CẦN KIỂM TRA</b>\n\n"
                     f"👤 Telegram ID: <code>{callback.from_user.id}</code>\n"
@@ -2614,6 +2999,8 @@ async def quick_qr_payment_callback(callback: CallbackQuery) -> None:
         quantity=quantity,
         order_id=order_id,
         expected_total=expected_total,
+        delivery_mode=str(product.get("deliveryMode") or "provider"),
+        product_note=str(product.get("desc") or ""),
     )
     await callback.answer("Đang tạo QR thanh toán…")
     try:
@@ -2837,6 +3224,7 @@ async def main() -> None:
     backup_database()
     backup_task = asyncio.create_task(database_backup_loop())
     daily_backup_task = asyncio.create_task(daily_database_backup_loop())
+    stock_watch_task = asyncio.create_task(provider_stock_watch_loop())
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     try:
         await bot.set_my_commands(
@@ -2865,8 +3253,9 @@ async def main() -> None:
     finally:
         backup_task.cancel()
         daily_backup_task.cancel()
+        stock_watch_task.cancel()
         try:
-            await asyncio.gather(backup_task, daily_backup_task)
+            await asyncio.gather(backup_task, daily_backup_task, stock_watch_task)
         except asyncio.CancelledError:
             pass
         await asyncio.to_thread(backup_database)
